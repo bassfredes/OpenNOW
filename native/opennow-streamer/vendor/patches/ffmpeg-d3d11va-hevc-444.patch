@@ -1,0 +1,242 @@
+--- a/libavcodec/dxva2.c
++++ b/libavcodec/dxva2.c
+@@ -44,6 +44,12 @@
+ DEFINE_GUID(ff_DXVA2_ModeVC1_D2010,      0x1b81beA4, 0xa0c7,0x11d3,0xb9,0x84,0x00,0xc0,0x4f,0x2e,0x73,0xc5);
+ DEFINE_GUID(ff_DXVA2_ModeHEVC_VLD_Main,  0x5b11d51b, 0x2f4c,0x4452,0xbc,0xc3,0x09,0xf2,0xa1,0x16,0x0c,0xc0);
+ DEFINE_GUID(ff_DXVA2_ModeHEVC_VLD_Main10,0x107af0e0, 0xef1a,0x4d19,0xab,0xa8,0x67,0xa1,0x63,0x07,0x3d,0x13);
++/* HEVC Range Extensions 4:4:4 modes (Windows SDK dxva.h). The driver
++ * advertises them for GPUs whose NVDEC silicon decodes HEVC 4:4:4, but the
++ * upstream mode table only ever listed Main/Main10 (4:2:0), so every
++ * Range Extensions stream silently fell back to software decode. */
++DEFINE_GUID(ff_DXVA2_ModeHEVC_VLD_Main_444,  0x4008018f,0xf537,0x4b36,0x98,0xcf,0x61,0xaf,0x8a,0x2c,0x1a,0x33);
++DEFINE_GUID(ff_DXVA2_ModeHEVC_VLD_Main10_444,0x0dabeffa,0x4458,0x4602,0xbc,0x03,0x07,0x95,0x65,0x9d,0x61,0x7c);
+ DEFINE_GUID(ff_DXVA2_ModeVP9_VLD_Profile0,0x463707f8,0xa1d0,0x4585,0x87,0x6d,0x83,0xaa,0x6d,0x60,0xb8,0x9e);
+ DEFINE_GUID(ff_DXVA2_ModeVP9_VLD_10bit_Profile2,0xa4c749ef,0x6ecf,0x48aa,0x84,0x48,0x50,0xa7,0xa1,0x16,0x5f,0xf7);
+ DEFINE_GUID(ff_DXVA2_ModeAV1_VLD_Profile0,0xb8be4ccb,0xcf53,0x46ba,0x8d,0x59,0xd6,0xb8,0xa6,0xda,0x5d,0x2a);
+@@ -74,6 +80,8 @@
+                                         AV_PROFILE_UNKNOWN};
+ static const int prof_hevc_main10[]  = {AV_PROFILE_HEVC_MAIN_10,
+                                         AV_PROFILE_UNKNOWN};
++static const int prof_hevc_rext_444[] = {AV_PROFILE_HEVC_REXT,
++                                        AV_PROFILE_UNKNOWN};
+ static const int prof_vp9_profile0[] = {AV_PROFILE_VP9_0,
+                                         AV_PROFILE_UNKNOWN};
+ static const int prof_vp9_profile2[] = {AV_PROFILE_VP9_2,
+@@ -103,6 +111,8 @@
+     { &ff_DXVA2_ModeVC1_D,           AV_CODEC_ID_WMV3 },
+ 
+     /* HEVC/H.265 */
++    { &ff_DXVA2_ModeHEVC_VLD_Main10_444, AV_CODEC_ID_HEVC, prof_hevc_rext_444 },
++    { &ff_DXVA2_ModeHEVC_VLD_Main_444,   AV_CODEC_ID_HEVC, prof_hevc_rext_444 },
+     { &ff_DXVA2_ModeHEVC_VLD_Main10, AV_CODEC_ID_HEVC, prof_hevc_main10 },
+     { &ff_DXVA2_ModeHEVC_VLD_Main,   AV_CODEC_ID_HEVC, prof_hevc_main },
+ 
+@@ -536,6 +546,7 @@
+     av_free(guid_list);
+     if (ret < 0)
+         return AVERROR(EINVAL);
++    sctx->decoder_guid = decoder_guid;
+ 
+     desc.SampleWidth  = avctx->coded_width;
+     desc.SampleHeight = avctx->coded_height;
+--- a/libavcodec/dxva2_internal.h
++++ b/libavcodec/dxva2_internal.h
+@@ -83,6 +83,11 @@
+ #endif
+ } AVDXVAContext;
+ 
++// HEVC 4:4:4 Range Extensions DXVA modes (defined in dxva2.c). Drivers
++// expect DXVA_PicParams_HEVC_RangeExt picture parameters for these GUIDs.
++extern const GUID ff_DXVA2_ModeHEVC_VLD_Main_444;
++extern const GUID ff_DXVA2_ModeHEVC_VLD_Main10_444;
++
+ typedef struct FFDXVASharedContext {
+     AVBufferRef *decoder_ref;
+ 
+@@ -92,6 +97,10 @@
+     // E.g. AV_PIX_FMT_D3D11 (same as AVCodecContext.pix_fmt, except during init)
+     enum AVPixelFormat pix_fmt;
+ 
++    // GUID the active decoder instance was created with; picture-parameter
++    // structure size depends on it (base vs Range Extensions).
++    GUID decoder_guid;
++
+     AVHWDeviceContext *device_ctx;
+ 
+ #if CONFIG_D3D11VA
+--- a/libavcodec/dxva2_hevc.c
++++ b/libavcodec/dxva2_hevc.c
+@@ -31,8 +31,47 @@
+ 
+ #define MAX_SLICES 256
+ 
++#if defined(__MINGW32__)
++/* Windows SDK dxva.h (10.0.22621+) defines DXVA_PicParams_HEVC_RangeExt;
++ * mingw-w64 does not. The layout must match Microsoft's exactly: for a
++ * Range Extensions 4:4:4 decoder GUID the driver validates the picture
++ * parameter buffer against this structure, and submitting the base
++ * DXVA_PicParams_HEVC (232 bytes) fails SubmitDecoderBuffers with
++ * E_INVALIDARG (0x80070057). */
++typedef struct _DXVA_PicParams_HEVC_RangeExt {
++    DXVA_PicParams_HEVC params;
++
++    union {
++        struct {
++            USHORT transform_skip_rotation_enabled_flag    : 1;
++            USHORT transform_skip_context_enabled_flag     : 1;
++            USHORT implicit_rdpcm_enabled_flag             : 1;
++            USHORT explicit_rdpcm_enabled_flag             : 1;
++            USHORT extended_precision_processing_flag      : 1;
++            USHORT intra_smoothing_disabled_flag           : 1;
++            USHORT persistent_rice_adaptation_enabled_flag : 1;
++            USHORT high_precision_offsets_enabled_flag     : 1;
++            USHORT cabac_bypass_alignment_enabled_flag     : 1;
++            USHORT cross_component_prediction_enabled_flag : 1;
++            USHORT chroma_qp_offset_list_enabled_flag      : 1;
++            USHORT ReservedBits8                           : 5;
++        };
++        USHORT dwRangeExtensionFlags;
++    };
++
++    UCHAR diff_cu_chroma_qp_offset_depth;
++    UCHAR log2_sao_offset_scale_luma;
++    UCHAR log2_sao_offset_scale_chroma;
++    UCHAR log2_max_transform_skip_block_size_minus2;
++    CHAR cb_qp_offset_list[6];
++    CHAR cr_qp_offset_list[6];
++    UCHAR chroma_qp_offset_list_len_minus1;
++    USHORT ReservedBits9;
++} DXVA_PicParams_HEVC_RangeExt;
++#endif
++
+ struct hevc_dxva2_picture_context {
+-    DXVA_PicParams_HEVC   pp;
++    DXVA_PicParams_HEVC_RangeExt pp;
+     DXVA_Qmatrix_HEVC     qm;
+     unsigned              slice_count;
+     DXVA_Slice_HEVC_Short slice_short[MAX_SLICES];
+@@ -57,6 +96,52 @@
+     return 0xff;
+ }
+ 
++/* True when the active decoder GUID is one of the HEVC Range Extensions
++ * 4:4:4 profiles, which require the extended picture parameter structure. */
++static int hevc_dxva_uses_range_ext(const AVCodecContext *avctx)
++{
++    FFDXVASharedContext *sctx = DXVA_SHARED_CONTEXT(avctx);
++    return IsEqualGUID(&sctx->decoder_guid, &ff_DXVA2_ModeHEVC_VLD_Main10_444) ||
++           IsEqualGUID(&sctx->decoder_guid, &ff_DXVA2_ModeHEVC_VLD_Main_444);
++}
++
++/* Append the Range Extensions tail (DXVA spec RExt picture parameters) to an
++ * already-filled base structure. Every field mirrors the SPS/PPS range
++ * extension syntax; FFmpeg keeps them flattened on HEVCSPS/HEVCPPS. */
++static void ff_dxva2_hevc_fill_range_extensions(const AVCodecContext *avctx,
++                                                DXVA_PicParams_HEVC_RangeExt *pp)
++{
++    const HEVCContext *h = avctx->priv_data;
++    const HEVCPPS *pps = h->pps;
++    const HEVCSPS *sps;
++
++    if (!pps || !(sps = pps->sps))
++        return;
++    pp->dwRangeExtensionFlags =
++        ((unsigned)sps->transform_skip_rotation_enabled         <<  0) |
++        ((unsigned)sps->transform_skip_context_enabled          <<  1) |
++        ((unsigned)sps->implicit_rdpcm_enabled                  <<  2) |
++        ((unsigned)sps->explicit_rdpcm_enabled                  <<  3) |
++        ((unsigned)sps->extended_precision_processing           <<  4) |
++        ((unsigned)sps->intra_smoothing_disabled                <<  5) |
++        ((unsigned)sps->persistent_rice_adaptation_enabled      <<  6) |
++        ((unsigned)sps->high_precision_offsets_enabled          <<  7) |
++        ((unsigned)sps->cabac_bypass_alignment_enabled          <<  8) |
++        ((unsigned)pps->cross_component_prediction_enabled_flag <<  9) |
++        ((unsigned)pps->chroma_qp_offset_list_enabled_flag      << 10);
++    pp->diff_cu_chroma_qp_offset_depth = pps->diff_cu_chroma_qp_offset_depth;
++    pp->log2_sao_offset_scale_luma     = pps->log2_sao_offset_scale_luma;
++    pp->log2_sao_offset_scale_chroma   = pps->log2_sao_offset_scale_chroma;
++    /* FFmpeg stores log2_max_transform_skip_block_size with the +2 bias. */
++    pp->log2_max_transform_skip_block_size_minus2 =
++        (UCHAR)(pps->log2_max_transform_skip_block_size - 2);
++    memcpy(pp->cb_qp_offset_list, pps->cb_qp_offset_list,
++           sizeof(pp->cb_qp_offset_list));
++    memcpy(pp->cr_qp_offset_list, pps->cr_qp_offset_list,
++           sizeof(pp->cr_qp_offset_list));
++    pp->chroma_qp_offset_list_len_minus1 = pps->chroma_qp_offset_list_len_minus1;
++}
++
+ void ff_dxva2_hevc_fill_picture_parameters(const AVCodecContext *avctx, AVDXVAContext *ctx,
+                                     DXVA_PicParams_HEVC *pp)
+ {
+@@ -375,8 +460,12 @@
+         return -1;
+     av_assert0(ctx_pic);
+ 
+-    /* Fill up DXVA_PicParams_HEVC */
+-    ff_dxva2_hevc_fill_picture_parameters(avctx, ctx, &ctx_pic->pp);
++    /* Fill up DXVA_PicParams_HEVC (+ the Range Extensions tail when the
++     * active decoder GUID is an RExt 4:4:4 profile). */
++    memset(&ctx_pic->pp, 0, sizeof(ctx_pic->pp));
++    ff_dxva2_hevc_fill_picture_parameters(avctx, ctx, &ctx_pic->pp.params);
++    if (hevc_dxva_uses_range_ext(avctx))
++        ff_dxva2_hevc_fill_range_extensions(avctx, &ctx_pic->pp);
+ 
+     /* Fill up DXVA_Qmatrix_HEVC */
+     ff_dxva2_hevc_fill_scaling_lists(avctx, ctx, &ctx_pic->qm);
+@@ -414,14 +503,24 @@
+ {
+     HEVCContext *h = avctx->priv_data;
+     struct hevc_dxva2_picture_context *ctx_pic = h->cur_frame->hwaccel_picture_private;
+-    int scale = ctx_pic->pp.dwCodingParamToolFlags & 1;
++    int scale = ctx_pic->pp.params.dwCodingParamToolFlags & 1;
++    const void *pp_data;
++    unsigned pp_size;
+     int ret;
+ 
+     if (ctx_pic->slice_count <= 0 || ctx_pic->bitstream_size <= 0)
+         return -1;
+ 
++    if (hevc_dxva_uses_range_ext(avctx)) {
++        pp_data = &ctx_pic->pp;
++        pp_size = sizeof(ctx_pic->pp);
++    } else {
++        pp_data = &ctx_pic->pp.params;
++        pp_size = sizeof(ctx_pic->pp.params);
++    }
++
+     ret = ff_dxva2_common_end_frame(avctx, h->cur_frame->f,
+-                                    &ctx_pic->pp, sizeof(ctx_pic->pp),
++                                    pp_data, pp_size,
+                                     scale ? &ctx_pic->qm : NULL, scale ? sizeof(ctx_pic->qm) : 0,
+                                     commit_bitstream_and_slice_buffer);
+     return ret;
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -658,6 +658,14 @@
+ #endif
+         break;
+     case AV_PIX_FMT_YUV444P:
++        /* D3D11VA can decode HEVC 4:4:4 on GPUs whose DXVA driver
++         * advertises the Range Extensions profiles (see dxva2.c); the
++         * upstream list only ever offered hardware formats for 4:2:0,
++         * silently forcing every 4:4:4 stream to software. */
++#if CONFIG_HEVC_D3D11VA_HWACCEL
++        *fmt++ = AV_PIX_FMT_D3D11VA_VLD;
++        *fmt++ = AV_PIX_FMT_D3D11;
++#endif
+ #if CONFIG_HEVC_VAAPI_HWACCEL
+         *fmt++ = AV_PIX_FMT_VAAPI;
+ #endif
+@@ -696,6 +704,12 @@
+ #endif
+         break;
+     case AV_PIX_FMT_YUV444P10:
++        /* Same D3D11VA offering as 4:2:0: the driver-side Range Extensions
++         * profiles make zero-copy 4:4:4 decode possible (dxva2.c). */
++#if CONFIG_HEVC_D3D11VA_HWACCEL
++        *fmt++ = AV_PIX_FMT_D3D11VA_VLD;
++        *fmt++ = AV_PIX_FMT_D3D11;
++#endif
+ #if CONFIG_HEVC_VIDEOTOOLBOX_HWACCEL
+         *fmt++ = AV_PIX_FMT_VIDEOTOOLBOX;
+ #endif

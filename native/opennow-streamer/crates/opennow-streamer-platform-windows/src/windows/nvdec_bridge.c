@@ -1,6 +1,14 @@
 /* Local opt-in experiment. NVDEC -> bounded CPU packing -> D3D11 upload.
  * No software fallback and no chroma reduction. FFmpeg owns the CUDA context.
+ *
+ * COBJMACROS must be defined before any Windows COM header: the Windows SDK
+ * declares ID3D11*_AddRef/GetDesc as functions unless the C accessor macros
+ * are enabled, and both the D3D11VA route and the optional GPU interop call
+ * them from C.
  */
+#ifndef COBJMACROS
+#define COBJMACROS
+#endif
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -235,3 +243,214 @@ int on_nvdec_receive(ONNvdec *d, uint32_t *out, size_t pixels, ONFrameInfo *info
 #ifdef OPENNOW_GPU_INTEROP
 #include "nvdec_gpu_bridge.h"
 #endif
+
+/* -------------------------------------------------------------------------
+ * D3D11VA (DXVA) zero-copy route for real HEVC 4:4:4.
+ *
+ * FFmpeg's stock dxva_modes table only ever advertised HEVC Main/Main10
+ * (4:2:0); with the repository patch
+ * vendor/patches/ffmpeg-d3d11va-hevc-444.patch the driver's Range Extensions
+ * 4:4:4 profiles are selected instead, decoding straight into the array
+ * texture of a pool created on OUR ID3D11Device (AV_PIX_FMT_D3D11) — no CPU
+ * copy, unlike the CUDA interop that caused device loss and is banned.
+ * ------------------------------------------------------------------------- */
+#include <libavutil/hwcontext_d3d11va.h>
+
+typedef struct OND3d11va {
+    AVCodecContext *ctx;
+    AVFrame *frame;
+    int width, height, depth;
+} OND3d11va;
+
+/* Only the hardware surface in our device is acceptable: a software frame
+ * here would mean the hwaccel silently disengaged (stock FFmpeg behaviour
+ * for Range Extensions streams), and continuing would burn CPU at 5K. */
+static enum AVPixelFormat on_d3d11va_get_format(AVCodecContext *ctx,
+                                                const enum AVPixelFormat *fmts) {
+    (void)ctx;
+    for (const enum AVPixelFormat *f = fmts; *f != AV_PIX_FMT_NONE; ++f)
+        if (*f == AV_PIX_FMT_D3D11)
+            return AV_PIX_FMT_D3D11;
+    return AV_PIX_FMT_NONE;
+}
+
+static void on_d3d11va_error(char *errbuf, int errbuf_len,
+                             const char *what, int code) {
+    if (!errbuf || errbuf_len <= 0)
+        return;
+    char detail[AV_ERROR_MAX_STRING_SIZE];
+    detail[0] = 0;
+    if (code)
+        av_strerror(code, detail, sizeof(detail));
+    snprintf(errbuf, (size_t)errbuf_len, "%s: %s", what, detail);
+}
+
+/* Shares the caller's ID3D11Device (AddRef'd; released with the hw device
+ * context). Returns NULL with errbuf describing the failure so the Rust
+ * side can log it and fall back to the NVDEC path. */
+OND3d11va *on_d3d11va_open(void *device, int width, int height, int depth,
+                           char *errbuf, int errbuf_len) {
+    if (!device) {
+        on_d3d11va_error(errbuf, errbuf_len, "null D3D11 device", 0);
+        return NULL;
+    }
+    if (width < 48 || width > 7680 || height < 48 || height > 4320) {
+        on_d3d11va_error(errbuf, errbuf_len, "unsupported decode extent", 0);
+        return NULL;
+    }
+    if (depth != 8 && depth != 10) {
+        on_d3d11va_error(errbuf, errbuf_len, "unsupported bit depth", 0);
+        return NULL;
+    }
+    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    if (!codec) {
+        on_d3d11va_error(errbuf, errbuf_len, "FFmpeg HEVC decoder missing", 0);
+        return NULL;
+    }
+    AVBufferRef *hwref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+    if (!hwref) {
+        on_d3d11va_error(errbuf, errbuf_len, "av_hwdevice_ctx_alloc", AVERROR(ENOMEM));
+        return NULL;
+    }
+    AVHWDeviceContext *hwc = (AVHWDeviceContext *)hwref->data;
+    AVD3D11VADeviceContext *d3d = (AVD3D11VADeviceContext *)hwc->hwctx;
+    /* The only mandatory field; device_context/video_device/video_context are
+     * derived from it on init, so decode happens on the same (multithread-
+     * protected) immediate context Qt presents from. */
+    ID3D11Device_AddRef((ID3D11Device *)device);
+    d3d->device = (ID3D11Device *)device;
+    int result = av_hwdevice_ctx_init(hwref);
+    if (result < 0) {
+        av_buffer_unref(&hwref);
+        on_d3d11va_error(errbuf, errbuf_len, "av_hwdevice_ctx_init", result);
+        return NULL;
+    }
+    OND3d11va *d = (OND3d11va *)calloc(1, sizeof(*d));
+    if (!d) {
+        av_buffer_unref(&hwref);
+        on_d3d11va_error(errbuf, errbuf_len, "decoder allocation", AVERROR(ENOMEM));
+        return NULL;
+    }
+    d->ctx = avcodec_alloc_context3(codec);
+    d->frame = av_frame_alloc();
+    if (!d->ctx || !d->frame) {
+        av_buffer_unref(&hwref);
+        avcodec_free_context(&d->ctx);
+        av_frame_free(&d->frame);
+        free(d);
+        on_d3d11va_error(errbuf, errbuf_len, "decoder allocation", AVERROR(ENOMEM));
+        return NULL;
+    }
+    d->ctx->hw_device_ctx = av_buffer_ref(hwref);
+    av_buffer_unref(&hwref);
+    d->ctx->get_format = on_d3d11va_get_format;
+    d->ctx->thread_count = 1;
+    d->ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    d->ctx->pkt_timebase = (AVRational){1, 1000000};
+    result = avcodec_open2(d->ctx, codec, NULL);
+    if (result < 0) {
+        on_d3d11va_error(errbuf, errbuf_len, "avcodec_open2", result);
+        avcodec_free_context(&d->ctx);
+        av_frame_free(&d->frame);
+        free(d);
+        return NULL;
+    }
+    d->width = width;
+    d->height = height;
+    d->depth = depth;
+    if (errbuf && errbuf_len > 0)
+        errbuf[0] = 0;
+    return d;
+}
+
+int on_d3d11va_send(OND3d11va *d, const uint8_t *data, int size,
+                    int64_t pts, int64_t duration, int key) {
+    if (!d || !data || size <= 0 || size > 32 * 1024 * 1024)
+        return -1;
+    AVPacket *p = av_packet_alloc();
+    if (!p)
+        return -1;
+    int result = av_new_packet(p, size);
+    if (result >= 0) {
+        memcpy(p->data, data, size);
+        p->pts = pts;
+        p->dts = pts;
+        p->duration = duration;
+        if (key)
+            p->flags |= AV_PKT_FLAG_KEY;
+        result = avcodec_send_packet(d->ctx, p);
+    }
+    av_packet_free(&p);
+    return result;
+}
+
+int on_d3d11va_drain(OND3d11va *d) {
+    return d ? avcodec_send_packet(d->ctx, NULL) : -1;
+}
+
+/* In-place flush for recovery keyframes: keeps the device and decoder
+ * instances, so recovery never restarts the whole decoder. */
+void on_d3d11va_flush(OND3d11va *d) {
+    if (!d)
+        return;
+    avcodec_flush_buffers(d->ctx);
+    av_frame_unref(d->frame);
+}
+
+void on_d3d11va_close(OND3d11va *d) {
+    if (!d)
+        return;
+    avcodec_free_context(&d->ctx);
+    av_frame_free(&d->frame);
+    free(d);
+}
+
+/* Returns 1 with a frame: *texture is an AddRef'd view of the pool's array
+ * texture (valid independently of *lease), *subresource addresses the array
+ * element, and *lease is an AVFrame clone that pins the pool slot until
+ * released. 0 = need more input, negative = validation failure (-4 not a
+ * hardware frame, -5 pool format mismatch). */
+int on_d3d11va_receive(OND3d11va *d, ID3D11Texture2D **texture,
+                       unsigned *subresource, void **lease, ONFrameInfo *info) {
+    if (!d || !texture || !subresource || !lease || !info)
+        return -1;
+    av_frame_unref(d->frame);
+    int result = avcodec_receive_frame(d->ctx, d->frame);
+    if (result == AVERROR(EAGAIN) || result == AVERROR_EOF)
+        return 0;
+    if (result < 0)
+        return result;
+    if (d->frame->format != AV_PIX_FMT_D3D11 || !d->frame->data[0])
+        return -4;
+    ID3D11Texture2D *tex = (ID3D11Texture2D *)d->frame->data[0];
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D_GetDesc(tex, &desc);
+    int want = d->depth == 10 ? DXGI_FORMAT_Y410 : DXGI_FORMAT_AYUV;
+    if ((int)desc.Format != want)
+        return -5;
+    AVFrame *held = av_frame_clone(d->frame);
+    if (!held)
+        return AVERROR(ENOMEM);
+    intptr_t index = (intptr_t)d->frame->data[1];
+    info->pixel_format = 0; /* Rust maps the DXGI format via output_layout */
+    info->width = d->width;
+    info->height = d->height;
+    info->source_depth = d->depth;
+    info->output_layout = d->depth == 10 ? 1 : 0; /* 1=Y410, 0=AYUV (NVDEC order) */
+    info->pts = d->frame->pts;
+    info->duration = d->frame->duration;
+    info->range = d->frame->color_range;
+    info->primaries = d->frame->color_primaries;
+    info->transfer = d->frame->color_trc;
+    info->matrix = d->frame->colorspace;
+    ID3D11Texture2D_AddRef(tex);
+    *lease = held;
+    *texture = tex;
+    *subresource = (unsigned)index * (desc.MipLevels ? desc.MipLevels : 1u);
+    return 1;
+}
+
+void on_d3d11va_release_lease(void *lease) {
+    AVFrame *frame = (AVFrame *)lease;
+    av_frame_free(&frame);
+}

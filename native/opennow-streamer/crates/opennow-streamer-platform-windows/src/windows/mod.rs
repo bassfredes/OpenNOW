@@ -10,6 +10,8 @@ macro_rules! video_log {
 
 mod audio;
 mod color;
+#[cfg(feature = "nvdec-experiment")]
+mod d3d11va;
 mod decoder;
 mod embedded;
 mod graphics;

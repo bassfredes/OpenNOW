@@ -127,3 +127,29 @@ ffmpeg -hide_banner -loglevel error -f lavfi \
 ```
 
 SHA256: `df7e79111e51d92e797143376f2990a4b69de1effd5932a709ee2625ecb31ddf`.
+
+## 5K HDR 4:4:4 zero-copy D3D11VA regression
+
+`hevc-y410-5k-pq.hevc` is a synthetic 300-frame (2.5 s at 120 fps)
+5120x2880 Main44410 (RExt) HEVC stream with PQ/BT.2020 metadata. Every 10-bit
+code value in every plane is the flat constant 876 (`0x036C`, encoded
+losslessly), so the D3D11VA acceptance test asserts exact DXGI Y410 samples
+after decoding. Raw intermediates are generated outside the repository under
+`..\tmp-fixtures\` (fixture hygiene); only this small encoded stream lives in
+the fixture directory. Generated on the dev machine with libx265:
+
+```sh
+# flat10.yuv: one yuv444p10le frame whose every 16-bit code is 0x036C, under ..\tmp-fixtures\, then:
+ffmpeg -hide_banner -loglevel warning -stream_loop 299 \
+  -f rawvideo -pix_fmt yuv444p10le -s 5120x2880 -r 120 -i ..\tmp-fixtures\flat10.yuv \
+  -frames:v 300 -c:v libx265 -preset ultrafast \
+  -x265-params 'log-level=error:pools=4:frame-threads=1:keyint=300:min-keyint=300:scenecut=0:lossless=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:chromaloc=0' \
+  -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv \
+  -f hevc -y hevc-y410-5k-pq.hevc
+```
+
+SHA256: `a117e1079704f6c72aab344de0b712f03338a904d1b595d1bfbd8e9737fc8082`.
+
+Decoding this stream through D3D11VA requires the patched FFmpeg SDK (stock
+FFmpeg never offers the D3D11 hardware format for 4:4:4 HEVC): see
+`native/opennow-streamer/vendor/patches/ffmpeg-d3d11va-hevc-444.patch`.

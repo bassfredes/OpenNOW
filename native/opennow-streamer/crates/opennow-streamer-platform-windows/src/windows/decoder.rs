@@ -84,6 +84,10 @@ pub(super) struct DecodedVideoFrame {
     pub(super) _sample: Option<IMFSample>,
     #[cfg(feature = "nvdec-gpu-interop")]
     pub(super) gpu_planes: Option<super::nvdec::GpuPlanes>,
+    // Pins the D3D11VA hardware pool slot of this frame until presentation
+    // drops it, exactly like _sample does for Media Foundation surfaces.
+    #[cfg(feature = "nvdec-experiment")]
+    pub(super) _lease: Option<super::d3d11va::D3d11vaLease>,
 }
 
 impl DecodedVideoFrame {
@@ -129,6 +133,8 @@ impl DecodedVideoFrame {
             _sample: Some(sample),
             #[cfg(feature = "nvdec-gpu-interop")]
             gpu_planes: None,
+            #[cfg(feature = "nvdec-experiment")]
+            _lease: None,
         })
     }
 }

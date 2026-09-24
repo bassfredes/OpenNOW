@@ -16,18 +16,18 @@ use std::{collections::VecDeque, ffi::c_void, ptr::NonNull};
 
 #[repr(C)]
 #[derive(Default)]
-struct FrameInfo {
-    pts: i64,
-    duration: i64,
-    range: i32,
-    primaries: i32,
-    transfer: i32,
-    matrix: i32,
-    pixel_format: i32,
-    width: i32,
-    height: i32,
-    source_depth: i32,
-    output_layout: i32,
+pub(super) struct FrameInfo {
+    pub(super) pts: i64,
+    pub(super) duration: i64,
+    pub(super) range: i32,
+    pub(super) primaries: i32,
+    pub(super) transfer: i32,
+    pub(super) matrix: i32,
+    pub(super) pixel_format: i32,
+    pub(super) width: i32,
+    pub(super) height: i32,
+    pub(super) source_depth: i32,
+    pub(super) output_layout: i32,
 }
 unsafe extern "C" {
     fn on_hevc_keyframe_layout(data: *const u8, size: i32, width: i32, height: i32) -> i32;
@@ -101,6 +101,7 @@ impl Drop for GpuPlanes {
 pub(super) enum Decoder {
     Mf(MfDecoder),
     Nv(NvDecoder),
+    D3d11va(super::d3d11va::D3d11vaDecoder),
 }
 impl Decoder {
     pub(super) fn new<G: DecoderDevice>(
@@ -130,39 +131,48 @@ impl Decoder {
         match self {
             Self::Mf(d) => d.wants_input(),
             Self::Nv(d) => !d.stopped && d.credit && d.timestamps.len() < 16,
+            Self::D3d11va(d) => d.wants_input(),
         }
     }
     pub(super) fn format(&self) -> VideoFormat {
         match self {
             Self::Mf(d) => d.format(),
             Self::Nv(d) => d.format,
+            Self::D3d11va(d) => d.format(),
         }
     }
     pub(super) fn stop(&mut self) {
         match self {
             Self::Mf(d) => d.stop(),
             Self::Nv(d) => d.stop(),
+            Self::D3d11va(d) => d.stop(),
         }
     }
     pub(super) fn reset_at_keyframe(&mut self) -> bool {
-        let Self::Nv(d) = self else { return false };
-        if d.stopped {
-            return false;
+        match self {
+            Self::D3d11va(d) => d.reset_at_keyframe(),
+            Self::Mf(_) => false,
+            Self::Nv(d) => {
+                if d.stopped {
+                    return false;
+                }
+                let started = std::time::Instant::now();
+                unsafe { on_nvdec_reset(d.handle.as_ptr()) };
+                d.timestamps.clear();
+                d.credit = true;
+                video_log!(
+                    "NVDEC keyframe reset retained CUDA context elapsed_us={}",
+                    started.elapsed().as_micros()
+                );
+                true
+            }
         }
-        let started = std::time::Instant::now();
-        unsafe { on_nvdec_reset(d.handle.as_ptr()) };
-        d.timestamps.clear();
-        d.credit = true;
-        video_log!(
-            "NVDEC keyframe reset retained CUDA context elapsed_us={}",
-            started.elapsed().as_micros()
-        );
-        true
     }
     pub(super) fn submit(&mut self, frame: EncodedVideoFrame) -> Result<(), String> {
         match self {
             Self::Mf(d) => d.submit(frame),
             Self::Nv(d) => d.submit(frame),
+            Self::D3d11va(d) => d.submit(frame),
         }
     }
     // The request may name a color quality the seat did not encode. Choose
@@ -183,18 +193,33 @@ impl Decoder {
         let Some(target) = plan_bitstream_decoder(self.format(), actual) else {
             return Ok(false);
         };
+        let mut routed_d3d11va = false;
         let replacement = match target {
             BitstreamDecoder::MediaFoundation => Self::Mf(MfDecoder::new(device, actual, mode)?),
-            BitstreamDecoder::Nvdec => Self::Nv(NvDecoder::new(device, actual)?),
+            BitstreamDecoder::FullChroma => {
+                match super::d3d11va::D3d11vaDecoder::new(device, actual, mode) {
+                    Ok(decoder) => {
+                        routed_d3d11va = true;
+                        Self::D3d11va(decoder)
+                    }
+                    Err(message) => {
+                        video_log!(
+                            "D3D11VA 4:4:4 route unavailable, falling back to NVDEC full-chroma: {message}"
+                        );
+                        Self::Nv(NvDecoder::new(device, actual)?)
+                    }
+                }
+            }
         };
         video_log!(
             "HEVC bitstream decoder selection: requested={:?} actual={:?} depth={} route={}; request and compressed pixels unchanged",
             requested.pixel_format,
             actual.pixel_format,
             actual.pixel_format.bit_depth(),
-            match target {
-                BitstreamDecoder::MediaFoundation => "Media Foundation D3D11",
-                BitstreamDecoder::Nvdec => "NVDEC full-chroma",
+            match (target, routed_d3d11va) {
+                (BitstreamDecoder::MediaFoundation, _) => "Media Foundation D3D11",
+                (BitstreamDecoder::FullChroma, true) => "D3D11VA Y410/AYUV zero-copy",
+                (BitstreamDecoder::FullChroma, false) => "NVDEC full-chroma",
             }
         );
         self.stop();
@@ -216,11 +241,20 @@ impl Decoder {
                 }
                 Ok(produced)
             }
+            Self::D3d11va(d) => {
+                let previous = d.format();
+                let produced = d.poll(frames)?;
+                if d.format() != previous {
+                    let _ = events.push(BackendEvent::VideoFormatChanged(d.format()));
+                }
+                Ok(produced)
+            }
         }
     }
     pub(super) fn probe_frame(&mut self, data: &[u8]) -> Result<DecodedVideoFrame, String> {
         match self {
             Self::Mf(d) => d.probe_frame(data),
+            Self::D3d11va(d) => d.probe_frame(data),
             Self::Nv(d) => {
                 d.submit(EncodedVideoFrame {
                     codec: VideoCodec::H265,
@@ -245,12 +279,13 @@ impl Decoder {
 }
 
 /// Which decoder presents a parsed bitstream layout: Media Foundation's
-/// D3D11 MFT negotiates NV12/P010 output for 4:2:0, NVDEC decodes the
-/// full-chroma 4:4:4 surfaces the MFT cannot.
+/// D3D11 MFT negotiates NV12/P010 output for 4:2:0; real 4:4:4 uses the
+/// zero-copy D3D11VA route when the driver supports it and falls back to the
+/// NVDEC CPU-transfer path otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BitstreamDecoder {
     MediaFoundation,
-    Nvdec,
+    FullChroma,
 }
 
 /// Rebuild the running decoder when its surfaces cannot present `actual`;
@@ -264,7 +299,7 @@ fn plan_bitstream_decoder(running: VideoFormat, actual: VideoFormat) -> Option<B
     }
     Some(match actual.chroma_format {
         VideoChromaFormat::Cs420 => BitstreamDecoder::MediaFoundation,
-        VideoChromaFormat::Cs444 => BitstreamDecoder::Nvdec,
+        VideoChromaFormat::Cs444 => BitstreamDecoder::FullChroma,
     })
 }
 
@@ -547,6 +582,7 @@ impl NvDecoder {
                 duration_100ns: duration,
                 _sample: None,
                 gpu_planes: Some(planes),
+                _lease: None,
             });
             return Ok(1);
         }
@@ -587,6 +623,8 @@ impl NvDecoder {
             _sample: None,
             #[cfg(feature = "nvdec-gpu-interop")]
             gpu_planes: None,
+            #[cfg(feature = "nvdec-experiment")]
+            _lease: None,
         });
         Ok(1)
     }
@@ -604,7 +642,10 @@ impl Drop for NvDecoder {
     }
 }
 
-fn decoded_color(mut format: VideoFormat, info: &FrameInfo) -> Result<VideoFormat, String> {
+pub(super) fn decoded_color(
+    mut format: VideoFormat,
+    info: &FrameInfo,
+) -> Result<VideoFormat, String> {
     format.full_range = match info.range {
         0 => format.full_range,
         1 => false,
@@ -748,7 +789,7 @@ mod tests {
         assert_eq!(actual.transfer_function, VideoTransferFunction::Sdr);
         assert_eq!(
             plan_bitstream_decoder(requested, actual),
-            Some(BitstreamDecoder::Nvdec),
+            Some(BitstreamDecoder::FullChroma),
             "real 4:4:4 keeps the full-chroma decoder"
         );
     }

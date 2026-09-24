@@ -58,6 +58,11 @@ use super::decoder::{DecodedVideoFrame, Decoder, DecoderDevice};
 // entire core. In particular, the final HaveOutput event must be drained even when transport has
 // stopped delivering compressed access units temporarily.
 const DECODER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+// Full decoder rebuilds are rate-limited: the 2026-09-24 evidence showed
+// the generation climbing 36 -> 226 in 90 s (a rebuild per recovery
+// keyframe). Recovery first asks for a fresh keyframe and only then rebuilds,
+// at most once per interval; in-place flushes are unaffected.
+const DECODER_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
 pub(super) const MAX_FRAME_SLOTS: usize = 8;
 // A broken driver may never return from codec work. Never join it on Qt's render
 // thread, but also never accumulate unbounded abandoned workers across retries.
@@ -1160,6 +1165,8 @@ fn run_decoder_worker(
     let mut submitted_frames = 0_u64;
     let mut produced_frames = 0_u64;
     let mut last_progress_log = Instant::now();
+    // Pre-expired so the first genuine failure may rebuild immediately.
+    let mut last_decoder_restart = Instant::now() - DECODER_RESTART_MIN_INTERVAL;
     let mut output = VecDeque::with_capacity(2);
     #[cfg(feature = "nvdec-experiment")]
     let select_native_chroma = std::env::var("OPENNOW_EXPERIMENTAL_NVDEC444").as_deref() == Ok("1")
@@ -1223,6 +1230,7 @@ fn run_decoder_worker(
                     frame_ready.as_ref(),
                     &mut decoder,
                     &mut submitted_any,
+                    &mut last_decoder_restart,
                 );
                 continue;
             }
@@ -1248,6 +1256,21 @@ fn run_decoder_worker(
                     made_progress = true;
                     break;
                 }
+                if last_decoder_restart.elapsed() < DECODER_RESTART_MIN_INTERVAL {
+                    // Rate-limited: an IDR is self-contained, so submit it to
+                    // the running decoder instead of tearing the pipeline
+                    // down again (the overflow/restart runaway).
+                    video_log!(
+                        "Embedded D3D11 decoder restart deferred (rate limit {:?} since last rebuild); submitting recovery keyframe in place",
+                        last_decoder_restart.elapsed()
+                    );
+                    pending_frame = Some(EncodedVideoFrame {
+                        reset_decoder: false,
+                        ..frame
+                    });
+                    made_progress = true;
+                    break;
+                }
                 decoder.stop();
                 decoded
                     .lock()
@@ -1257,6 +1280,7 @@ fn run_decoder_worker(
                 match Decoder::new(&device, format, mode) {
                     Ok(replacement) => {
                         decoder = replacement;
+                        last_decoder_restart = Instant::now();
                         submitted_any = false;
                         // The queued frames follow this keyframe. Clearing them
                         // silently breaks the next P-frame's reference chain.
@@ -1288,6 +1312,7 @@ fn run_decoder_worker(
                             frame_ready.as_ref(),
                             &mut decoder,
                             &mut submitted_any,
+                            &mut last_decoder_restart,
                         );
                         made_progress = true;
                         break;
@@ -1350,6 +1375,7 @@ fn run_decoder_worker(
                     frame_ready.as_ref(),
                     &mut decoder,
                     &mut submitted_any,
+                    &mut last_decoder_restart,
                 );
                 made_progress = true;
                 break;
@@ -1407,6 +1433,7 @@ fn wait_for_recovery_keyframe(
     frame_ready: &dyn Fn(),
     decoder: &mut Decoder,
     submitted_any: &mut bool,
+    last_decoder_restart: &mut Instant,
 ) -> Option<EncodedVideoFrame> {
     while !stopping.load(Ordering::Acquire) {
         let Some(frame) = encoded.pop_timeout(DECODER_POLL_INTERVAL) else {
@@ -1415,8 +1442,15 @@ fn wait_for_recovery_keyframe(
         if !frame.key_frame {
             continue;
         }
+        if last_decoder_restart.elapsed() < DECODER_RESTART_MIN_INTERVAL {
+            // A rebuild just happened: demand a fresh keyframe instead of
+            // hammering Decoder::new on every arrival (restart runaway).
+            let _ = events.push(BackendEvent::KeyFrameRequired);
+            continue;
+        }
         match Decoder::new(device, format, mode) {
             Ok(replacement) => {
+                *last_decoder_restart = Instant::now();
                 *decoder = replacement;
                 *submitted_any = false;
                 decoded
@@ -3016,6 +3050,8 @@ mod tests {
                 _sample: None,
                 #[cfg(feature = "nvdec-gpu-interop")]
                 gpu_planes: None,
+                #[cfg(feature = "nvdec-experiment")]
+                _lease: None,
             };
             resources
                 .record(0, &transient)
@@ -3287,6 +3323,270 @@ mod tests {
             d3d11_texture_format(ten_bit.Format),
             D3d11TextureFormat::Rgb10A2
         );
+    }
+
+    /// Annex-B HEVC to access units: a first-slice VCL NAL starts a new unit,
+    /// leading parameter sets stay with the picture that follows them, and
+    /// non-first slices or trailing SEI remain with their picture.
+    fn annexb_access_units(data: &[u8]) -> Vec<(&[u8], bool)> {
+        struct Nal<'a> {
+            bytes: &'a [u8],
+            unit_type: u8,
+            first_slice: bool,
+        }
+        let mut nals: Vec<Nal<'_>> = Vec::new();
+        let mut index = 0;
+        while index + 3 < data.len() {
+            let start = if data[index] == 0 && data[index + 1] == 0 && data[index + 2] == 1 {
+                index + 3
+            } else if index + 4 <= data.len()
+                && data[index] == 0
+                && data[index + 1] == 0
+                && data[index + 2] == 0
+                && data[index + 3] == 1
+            {
+                index + 4
+            } else {
+                index += 1;
+                continue;
+            };
+            if start >= data.len() {
+                break;
+            }
+            let unit_type = (data[start] >> 1) & 0x3f;
+            let first_slice = data.get(start + 2).is_some_and(|byte| byte & 0x80 != 0);
+            nals.push(Nal {
+                bytes: &data[index..],
+                unit_type,
+                first_slice,
+            });
+            index = start + 2;
+        }
+        let mut units: Vec<(&[u8], bool)> = Vec::new();
+        let mut seen_picture = false;
+        for nal in &nals {
+            let starts_picture = nal.unit_type <= 21 && nal.first_slice;
+            let irap = (16..=21).contains(&nal.unit_type);
+            if units.is_empty() {
+                // The first NAL starts the first unit, which may be leading
+                // parameter sets; the first picture then joins it below.
+                units.push((nal.bytes, starts_picture && irap));
+                seen_picture = starts_picture;
+                continue;
+            }
+            if starts_picture {
+                if seen_picture {
+                    // The previous unit ends where this picture begins.
+                    let end = nal.bytes.as_ptr() as usize;
+                    let (previous, _) = units.last_mut().expect("a unit precedes a later picture");
+                    let start = previous.as_ptr() as usize;
+                    debug_assert!(end >= start);
+                    unsafe {
+                        *previous = std::slice::from_raw_parts(previous.as_ptr(), end - start);
+                    }
+                    units.push((nal.bytes, irap));
+                } else {
+                    // Leading parameter sets: this first picture joins their
+                    // unit instead of creating a header-only access unit.
+                    units.last_mut().expect("header-only unit").1 = irap;
+                }
+                seen_picture = true;
+            }
+            // Non-first slices and trailing SEI already extend from their
+            // unit's start; the next picture boundary truncates them in.
+        }
+        units
+    }
+
+    /// Acceptance: the D3D11VA route decodes a real 5K 10-bit 4:4:4 HEVC
+    /// stream end-to-end with zero CPU copies at >= 120 fps sustained, and
+    /// the presented DXGI Y410 texture carries the fixture's exact lossless
+    /// samples (every plane is Y=U=V=876 in 10-bit code values).
+    #[test]
+    fn d3d11va_decodes_5k_444_at_120fps_with_exact_y410_samples() {
+        let _runtime = EmbeddedMediaRuntime::initialize().expect("Media Foundation");
+        let mut device: Option<::windows::Win32::Graphics::Direct3D11::ID3D11Device> = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .expect("D3D11 hardware device");
+        }
+        let device = device.unwrap();
+        let context = context.unwrap();
+        let format = VideoFormat {
+            width: 5120,
+            height: 2880,
+            pixel_format: VideoPixelFormat::Y410,
+            chroma_format: VideoChromaFormat::Cs444,
+            transfer_function: VideoTransferFunction::Pq,
+            color_primaries: crate::VideoColorPrimaries::Bt2020,
+            color_matrix: VideoColorMatrix::Bt2020,
+            ..color_test_format()
+        };
+        format.validate().expect("5K HDR 4:4:4 format");
+        let resources = unsafe {
+            AdoptedResources::new(
+                AdoptedD3d11Context {
+                    device: device.as_raw(),
+                    immediate_context: context.as_raw(),
+                },
+                format,
+            )
+        }
+        .unwrap();
+        let decoder = super::super::d3d11va::D3d11vaDecoder::new(
+            &resources,
+            format,
+            WindowsDecoderMode::Hardware,
+        )
+        .expect("D3D11VA HEVC 4:4:4 decoder open on this GPU");
+        let mut decoder = decoder;
+        let data = include_bytes!("../../fixtures/probe/hevc-y410-5k-pq.hevc");
+        let access_units = annexb_access_units(data);
+        let total = access_units.len();
+        assert!(
+            total >= 240,
+            "5K 4:4:4 fixture must carry at least two seconds of 120 fps video, found {total} access units"
+        );
+        const FRAME_DURATION_100NS: i64 = 10_000_000 / 120;
+        let mut output = VecDeque::new();
+        let mut submit_time = std::time::Duration::ZERO;
+        let mut receive_time = std::time::Duration::ZERO;
+        let mut produced = 0_usize;
+        let mut first_frame = None;
+        let wall_start = Instant::now();
+        for (index, (unit, irap)) in access_units.into_iter().enumerate() {
+            let started = Instant::now();
+            decoder
+                .submit(EncodedVideoFrame {
+                    codec: crate::VideoCodec::H265,
+                    data: unit.to_vec(),
+                    timestamp_100ns: index as i64 * FRAME_DURATION_100NS,
+                    duration_100ns: FRAME_DURATION_100NS,
+                    key_frame: irap,
+                    reset_decoder: false,
+                })
+                .expect("D3D11VA submit of a complete access unit");
+            submit_time += started.elapsed();
+            let started = Instant::now();
+            loop {
+                let before = output.len();
+                decoder.poll(&mut output).expect("D3D11VA receive");
+                if output.len() == before {
+                    break;
+                }
+                while let Some(frame) = output.pop_front() {
+                    if first_frame.is_none() {
+                        first_frame = Some(frame);
+                    }
+                    produced += 1;
+                }
+            }
+            receive_time += started.elapsed();
+        }
+        let _ = decoder.drain();
+        loop {
+            let before = produced;
+            decoder.poll(&mut output).expect("D3D11VA final receive");
+            while let Some(frame) = output.pop_front() {
+                if first_frame.is_none() {
+                    first_frame = Some(frame);
+                }
+                produced += 1;
+            }
+            if produced == before {
+                break;
+            }
+        }
+        let wall = wall_start.elapsed();
+        let fps = produced as f64 / wall.as_secs_f64();
+        video_log!(
+            "D3D11VA 5K 4:4:4 acceptance: units={} produced={} wall={:?} fps={:.1} submitTotal={:?} receiveTotal={:?}",
+            total,
+            produced,
+            wall,
+            fps,
+            submit_time,
+            receive_time
+        );
+        assert_eq!(produced, total, "every access unit must present a frame");
+        assert!(
+            fps >= 120.0,
+            "D3D11VA 5K 4:4:4 decode presented {produced} frames in {wall:?} = {fps:.1} fps; need >= 120 fps sustained"
+        );
+
+        let frame = first_frame.expect("first decoded frame");
+        assert_eq!(frame.format.pixel_format, VideoPixelFormat::Y410);
+        assert_eq!(frame.format.chroma_format, VideoChromaFormat::Cs444);
+        assert_eq!(frame.format.width, 5120);
+        assert_eq!(frame.format.height, 2880);
+        // Read the presented texture back exactly once: the fixture is
+        // lossless, so every decoded 10-bit code value must equal the source.
+        let mut description = D3D11_TEXTURE2D_DESC::default();
+        unsafe { frame.texture.GetDesc(&mut description) };
+        assert_eq!(
+            description.Format, DXGI_FORMAT_Y410,
+            "D3D11VA pool must be DXGI_FORMAT_Y410"
+        );
+        let mut staging_description = description;
+        staging_description.Usage = D3D11_USAGE_STAGING;
+        staging_description.BindFlags = 0;
+        staging_description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        staging_description.MiscFlags = 0;
+        staging_description.ArraySize = 1;
+        staging_description.MipLevels = 1;
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&staging_description, None, Some(&mut staging)) }
+            .expect("Y410 staging texture");
+        let staging = staging.unwrap();
+        unsafe {
+            context.CopySubresourceRegion(
+                &staging,
+                0,
+                0,
+                0,
+                0,
+                &frame.texture,
+                frame.subresource,
+                None,
+            );
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .expect("map Y410 staging");
+        let expected = (876, 876, 876);
+        unsafe {
+            let row = mapped.pData.cast::<u8>();
+            for (x, y) in [(0, 0), (2560, 1440), (5119, 2879)] {
+                let offset = y as usize * mapped.RowPitch as usize + x as usize * 4;
+                let dword = u32::from_le_bytes([
+                    *row.add(offset),
+                    *row.add(offset + 1),
+                    *row.add(offset + 2),
+                    *row.add(offset + 3),
+                ]);
+                let u = dword & 0x3ff;
+                let luma = (dword >> 10) & 0x3ff;
+                let v = (dword >> 20) & 0x3ff;
+                assert_eq!(
+                    (luma, u, v),
+                    expected,
+                    "exact Y410 sample at ({x},{y}) dword={dword:#010x}"
+                );
+            }
+        }
+        unsafe { context.Unmap(&staging, 0) };
+        drop(frame);
     }
 
     fn color_test_format() -> VideoFormat {
