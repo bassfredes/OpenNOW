@@ -749,12 +749,16 @@ fn enable_multithread_protection(context: &ID3D11DeviceContext) -> Result<(), St
     let multithread: ID3D10Multithread = context
         .cast()
         .map_err(|error| format!("Qt D3D11 context has no multithread interface: {error}"))?;
+    let was_protected = unsafe { multithread.GetMultithreadProtected() }.as_bool();
     unsafe {
         let _ = multithread.SetMultithreadProtected(true);
         if !multithread.GetMultithreadProtected().as_bool() {
             return Err("Qt D3D11 context rejected multithread protection".to_owned());
         }
     }
+    video_log!(
+        "D3D11 multithread protection: immediate context protected=true (was protected={was_protected})"
+    );
     Ok(())
 }
 
@@ -3404,6 +3408,7 @@ mod tests {
     /// samples (every plane is Y=U=V=876 in 10-bit code values).
     #[test]
     fn d3d11va_decodes_5k_444_at_120fps_with_exact_y410_samples() {
+        let _watchdog = Watchdog::arm("5K 4:4:4 acceptance", 120);
         let _runtime = EmbeddedMediaRuntime::initialize().expect("Media Foundation");
         let mut device: Option<::windows::Win32::Graphics::Direct3D11::ID3D11Device> = None;
         let mut context = None;
@@ -3598,6 +3603,7 @@ mod tests {
     #[cfg(feature = "nvdec-experiment")]
     #[test]
     fn live_5k_444_session_start_routes_d3d11va_and_presents_frames() {
+        let _watchdog = Watchdog::arm("live session", 120);
         let _runtime = EmbeddedMediaRuntime::initialize().expect("Media Foundation");
         let mut device: Option<::windows::Win32::Graphics::Direct3D11::ID3D11Device> = None;
         let mut context = None;
@@ -3719,6 +3725,715 @@ mod tests {
         assert_eq!(presented_format.height, 2880);
         decoder.stop();
         Ok(())
+    }
+
+    /// Read a presented Y410 frame into tightly packed texels (DXGI Y410:
+    /// U at bits 0-9, Y at 10-19, V at 20-29) for comparison against the
+    /// software reference.
+    fn readback_y410(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        frame: &DecodedVideoFrame,
+    ) -> Vec<u32> {
+        let mut description = D3D11_TEXTURE2D_DESC::default();
+        unsafe { frame.texture.GetDesc(&mut description) };
+        assert_eq!(
+            description.Format, DXGI_FORMAT_Y410,
+            "motion readback expects a Y410 surface"
+        );
+        let mut staging_description = description;
+        staging_description.Usage = D3D11_USAGE_STAGING;
+        staging_description.BindFlags = 0;
+        staging_description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        staging_description.MiscFlags = 0;
+        staging_description.ArraySize = 1;
+        staging_description.MipLevels = 1;
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&staging_description, None, Some(&mut staging)) }
+            .expect("Y410 staging texture");
+        let staging = staging.unwrap();
+        unsafe {
+            context.CopySubresourceRegion(
+                &staging,
+                0,
+                0,
+                0,
+                0,
+                &frame.texture,
+                frame.subresource,
+                None,
+            );
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .expect("map Y410 staging");
+        let mut pixels = vec![0_u32; 5120 * 2880];
+        unsafe {
+            let base = mapped.pData.cast::<u8>();
+            for y in 0..2880 {
+                let row = base.add(y * mapped.RowPitch as usize);
+                let texels = std::slice::from_raw_parts(row.cast::<u32>(), 5120);
+                pixels[y * 5120..(y + 1) * 5120].copy_from_slice(texels);
+            }
+            context.Unmap(&staging, 0);
+        }
+        pixels
+    }
+
+    /// PSNR of one frame's three planes against a `yuv444p10le` software
+    /// frame (planar little-endian 10-bit, Y then U then V). Returns the
+    /// combined PSNR plus the per-plane PSNRs for diagnostics.
+    fn motion_frame_psnr(ours: &[u32], software: &[u8]) -> (f64, [f64; 3]) {
+        const SAMPLES: usize = 5120 * 2880;
+        const MAX_CODE: f64 = 1023.0;
+        let mut plane_psnr = [0.0_f64; 3];
+        let mut total_sse = 0_u64;
+        for (plane, plane_result) in plane_psnr.iter_mut().enumerate() {
+            let mut sse = 0_u64;
+            for (index, texel) in ours.iter().copied().enumerate().take(SAMPLES) {
+                let ours_sample = match plane {
+                    0 => (texel >> 10) & 0x3ff,
+                    1 => texel & 0x3ff,
+                    _ => (texel >> 20) & 0x3ff,
+                };
+                let offset = (plane * SAMPLES + index) * 2;
+                let reference = u16::from_le_bytes([software[offset], software[offset + 1]]) as u32;
+                let difference = ours_sample as i64 - (reference & 0x3ff) as i64;
+                sse += (difference * difference) as u64;
+            }
+            *plane_result = if sse == 0 {
+                100.0
+            } else {
+                10.0 * (MAX_CODE * MAX_CODE * SAMPLES as f64 / sse as f64).log10()
+            };
+            total_sse += sse;
+        }
+        let combined = if total_sse == 0 {
+            100.0
+        } else {
+            10.0 * (MAX_CODE * MAX_CODE * (3 * SAMPLES) as f64 / total_sse as f64).log10()
+        };
+        (combined, plane_psnr)
+    }
+
+    /// Hard timeout for D3D11/threads tests (coordinator directive after
+    /// the30-minute without-fix deadlock): a lock or driver deadlock must
+    /// fail the run within seconds instead of hanging it. Dropping the
+    /// returned guard marks the test finished.
+    struct Watchdog(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Watchdog {
+        fn arm(name: &'static str, seconds: u64) -> Self {
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = std::sync::Arc::clone(&done);
+            std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    if start.elapsed() >= std::time::Duration::from_secs(seconds) {
+                        eprintln!("WATCHDOG: {name} exceeded {seconds}s — presumed deadlock");
+                        std::process::exit(70);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            });
+            Self(done)
+        }
+    }
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// FFmpeg software decode of a clip as the PSNR reference, streamed as
+    /// raw `yuv444p10le` frames from a child process (temp-file input
+    /// avoids stdin/stdout pipe deadlock).
+    struct SoftwareReference {
+        child: std::process::Child,
+        stdout: std::io::BufReader<std::process::ChildStdout>,
+        temp: std::path::PathBuf,
+        frame: Vec<u8>,
+    }
+
+    impl SoftwareReference {
+        fn spawn(clip: &[u8], name: &str) -> Self {
+            let ffmpeg_dir = std::env::var("OPENNOW_FFMPEG_DIR")
+                .expect("OPENNOW_FFMPEG_DIR must point at an FFmpeg SDK with bin/ffmpeg.exe");
+            let ffmpeg = std::path::Path::new(&ffmpeg_dir)
+                .join("bin")
+                .join("ffmpeg.exe");
+            let temp = std::env::temp_dir()
+                .join(format!("opennow-psnr-{name}-{}.hevc", std::process::id()));
+            std::fs::write(&temp, clip).expect("write software input clip");
+            let mut child = std::process::Command::new(&ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&temp)
+                .args(["-f", "rawvideo", "-pix_fmt", "yuv444p10le", "-"])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn FFmpeg software reference decode");
+            let stdout = std::io::BufReader::new(child.stdout.take().expect("software stdout"));
+            Self {
+                child,
+                stdout,
+                temp,
+                frame: vec![0_u8; 5120 * 2880 * 6],
+            }
+        }
+
+        /// The next decoded frame, or `None` at end of stream.
+        fn next_frame(&mut self) -> Option<&[u8]> {
+            std::io::Read::read_exact(&mut self.stdout, &mut self.frame)
+                .ok()
+                .map(|()| &self.frame[..])
+        }
+
+        fn finish(mut self) {
+            let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.temp);
+        }
+    }
+
+    /// Pack a software `yuv444p10le` frame into DXGI Y410 texels
+    /// (U at bits 0-9, Y at 10-19, V at 20-29; alpha3 like NVDEC output).
+    fn planar10_to_y410(software: &[u8]) -> Vec<u32> {
+        const SAMPLES: usize = 5120 * 2880;
+        let plane =
+            |index: usize| -> &[u8] { &software[index * SAMPLES * 2..(index + 1) * SAMPLES * 2] };
+        let (y, u, v) = (plane(0), plane(1), plane(2));
+        (0..SAMPLES)
+            .map(|index| {
+                let luma = u16::from_le_bytes([y[index * 2], y[index * 2 + 1]]) as u32;
+                let cb = u16::from_le_bytes([u[index * 2], u[index * 2 + 1]]) as u32;
+                let cr = u16::from_le_bytes([v[index * 2], v[index * 2 + 1]]) as u32;
+                0xC000_0000 | ((cr & 0x3ff) << 20) | ((luma & 0x3ff) << 10) | (cb & 0x3ff)
+            })
+            .collect()
+    }
+
+    /// A plain (non-array) Y410 texture holding reference texels — the
+    /// control input for the presenter-consistency oracle.
+    fn create_y410_upload(device: &ID3D11Device, texels: &[u32]) -> ID3D11Texture2D {
+        use ::windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA;
+        let mut texture = None;
+        unsafe {
+            device
+                .CreateTexture2D(
+                    &D3D11_TEXTURE2D_DESC {
+                        Width: 5120,
+                        Height: 2880,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: DXGI_FORMAT_Y410,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Usage: D3D11_USAGE_DEFAULT,
+                        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                        ..Default::default()
+                    },
+                    Some(&D3D11_SUBRESOURCE_DATA {
+                        pSysMem: texels.as_ptr().cast(),
+                        SysMemPitch: 5120 * 4,
+                        SysMemSlicePitch: 0,
+                    }),
+                    Some(&mut texture),
+                )
+                .expect("create Y410 reference upload");
+        }
+        texture.expect("Y410 reference upload")
+    }
+
+    /// Dword readback of any 4-byte-per-pixel texture slice.
+    fn readback_texels(
+        context: &ID3D11DeviceContext,
+        texture: &ID3D11Texture2D,
+        subresource: u32,
+        width: usize,
+        height: usize,
+    ) -> Vec<u32> {
+        let mut description = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut description) };
+        let mut staging_description = description;
+        staging_description.Usage = D3D11_USAGE_STAGING;
+        staging_description.BindFlags = 0;
+        staging_description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        staging_description.MiscFlags = 0;
+        staging_description.ArraySize = 1;
+        staging_description.MipLevels = 1;
+        let mut staging = None;
+        let device = unsafe { texture.GetDevice() }.expect("texture device");
+        unsafe { device.CreateTexture2D(&staging_description, None, Some(&mut staging)) }
+            .expect("staging texture");
+        let staging = staging.unwrap();
+        unsafe {
+            context.CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, subresource, None);
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .expect("map staging");
+        let mut texels = vec![0_u32; width * height];
+        unsafe {
+            let base = mapped.pData.cast::<u8>();
+            for y in 0..height {
+                let row = base.add(y * mapped.RowPitch as usize);
+                texels[y * width..(y + 1) * width]
+                    .copy_from_slice(std::slice::from_raw_parts(row.cast::<u32>(), width));
+            }
+            context.Unmap(&staging, 0);
+        }
+        texels
+    }
+
+    /// Step 1c repro: both real-motion 5K 4:4:4 clips decoded through our
+    /// D3D11VA bridge and through FFmpeg software (the reference) must match
+    /// at >= 50 dB PSNR on every frame. The rolling window mirrors the live
+    /// presenter queue (leases stay held for up to
+    /// `ADAPTIVE_VIDEO_QUEUE_CAPACITY` frames, exactly like a live session).
+    #[test]
+    fn d3d11va_motion_clips_match_software_psnr_ge_50db() {
+        let _watchdog = Watchdog::arm("motion PSNR", 600);
+        let _runtime = EmbeddedMediaRuntime::initialize().expect("Media Foundation");
+        let mut device: Option<ID3D11Device> = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .expect("D3D11 hardware device");
+        }
+        let device = device.unwrap();
+        let context = context.unwrap();
+        let format = VideoFormat {
+            width: 5120,
+            height: 2880,
+            pixel_format: VideoPixelFormat::Y410,
+            chroma_format: VideoChromaFormat::Cs444,
+            transfer_function: VideoTransferFunction::Pq,
+            color_primaries: crate::VideoColorPrimaries::Bt2020,
+            color_matrix: VideoColorMatrix::Bt2020,
+            ..color_test_format()
+        };
+        format.validate().expect("5K HDR 4:4:4 format");
+        for (name, clip) in [
+            (
+                "bf0",
+                &include_bytes!("../../fixtures/probe/hevc-y410-5k-motion-bf0.hevc")[..],
+            ),
+            (
+                "bf2",
+                &include_bytes!("../../fixtures/probe/hevc-y410-5k-motion-bf2.hevc")[..],
+            ),
+        ] {
+            verify_motion_psnr(name, clip, &device, &context, format);
+        }
+    }
+
+    fn verify_motion_psnr(
+        name: &str,
+        clip: &[u8],
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        format: VideoFormat,
+    ) {
+        let mut resources = unsafe {
+            AdoptedResources::new(
+                AdoptedD3d11Context {
+                    device: device.as_raw(),
+                    immediate_context: context.as_raw(),
+                },
+                format,
+            )
+        }
+        .unwrap();
+        let units = annexb_access_units(clip);
+        let expected = units.len();
+        assert!(
+            expected >= 40,
+            "{name}: clip must carry inter frames, got {expected}"
+        );
+
+        // Software reference: raw yuv444p10le frames streamed from a child
+        // process; a temp file input avoids stdin/stdout pipe deadlock.
+        let mut software = SoftwareReference::spawn(clip, name);
+
+        let mut decoder = super::super::d3d11va::D3d11vaDecoder::new(
+            &resources,
+            format,
+            WindowsDecoderMode::Hardware,
+        )
+        .expect("D3D11VA decoder for the motion clip");
+        let mut output = VecDeque::new();
+        let mut rolling: VecDeque<super::super::decoder::DecodedVideoFrame> = VecDeque::new();
+        let mut compared = 0_usize;
+        let mut compared_psnr = Vec::with_capacity(expected);
+
+        let mut compare = |frame: super::super::decoder::DecodedVideoFrame,
+                           compared: &mut usize,
+                           psnr_list: &mut Vec<f64>| {
+            let pixels = readback_y410(device, context, &frame);
+            let software_pixels = software
+                .next_frame()
+                .expect("software reference frame available");
+            let (combined, planes) = motion_frame_psnr(&pixels, software_pixels);
+            if combined < 50.0 {
+                panic!(
+                    "{name} frame {} below 50 dB: combined={combined:.2} dB \
+                     planes[Y={:.2} U={:.2} V={:.2}] dB — \
+                     inter-reference corruption (wrong refs, RangeExt params, \
+                     or a presenter/surface race)",
+                    *compared, planes[0], planes[1], planes[2]
+                );
+            }
+            // Presenter oracle: the live screen comes from
+            // Y410Converter::record. Identical pixels — (a) our decoded
+            // array-slice frame and (b) the reference texels in a plain
+            // upload texture — must convert to bit-identical RGB; any
+            // wrong-slice, wrong-region or timing mistake in the present
+            // path (the live block smear) diverges here.
+            let reference_texels = planar10_to_y410(software_pixels);
+            let reference_texture = create_y410_upload(device, &reference_texels);
+            let reference_frame = DecodedVideoFrame {
+                format: frame.format,
+                aperture: frame.aperture,
+                texture: reference_texture,
+                subresource: 0,
+                timestamp_100ns: frame.timestamp_100ns,
+                duration_100ns: frame.duration_100ns,
+                _sample: None,
+                #[cfg(feature = "nvdec-gpu-interop")]
+                gpu_planes: None,
+                #[cfg(feature = "nvdec-experiment")]
+                _lease: None,
+            };
+            let slot_ours = (*compared as u32) % 4;
+            let slot_reference = ((*compared as u32) + 4) % 4;
+            let recorded_ours = resources
+                .record(slot_ours, &frame)
+                .expect("record decoded array-slice frame");
+            let recorded_reference = resources
+                .record(slot_reference, &reference_frame)
+                .expect("record plain reference frame");
+            drop(frame);
+            let ours_texture =
+                ManuallyDrop::new(unsafe { ID3D11Texture2D::from_raw(recorded_ours.texture) });
+            let reference_out =
+                ManuallyDrop::new(unsafe { ID3D11Texture2D::from_raw(recorded_reference.texture) });
+            let ours_rgb = readback_texels(context, &ours_texture, 0, 5120, 2880);
+            let reference_rgb = readback_texels(context, &reference_out, 0, 5120, 2880);
+            if ours_rgb != reference_rgb {
+                let mismatch = ours_rgb
+                    .iter()
+                    .zip(&reference_rgb)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0);
+                panic!(
+                    "{name} frame {}: presenter output diverges at texel {} \
+                     decoded={:#010x} reference={:#010x} ({} of {} texels differ) — \
+                     the present path reads the wrong slice or region",
+                    *compared,
+                    mismatch,
+                    ours_rgb[mismatch],
+                    reference_rgb[mismatch],
+                    ours_rgb
+                        .iter()
+                        .zip(&reference_rgb)
+                        .filter(|(a, b)| a != b)
+                        .count(),
+                    ours_rgb.len()
+                );
+            }
+            psnr_list.push(combined);
+            *compared += 1;
+        };
+
+        for (index, (unit, irap)) in units.iter().enumerate() {
+            decoder
+                .submit(EncodedVideoFrame {
+                    codec: crate::VideoCodec::H265,
+                    data: unit.to_vec(),
+                    timestamp_100ns: index as i64 * (10_000_000 / 120),
+                    duration_100ns: 10_000_000 / 120,
+                    key_frame: *irap,
+                    reset_decoder: false,
+                })
+                .expect("motion clip submit");
+            loop {
+                let produced = decoder.poll(&mut output).expect("motion clip poll");
+                while let Some(frame) = output.pop_front() {
+                    rolling.push_back(frame);
+                    while rolling.len() > crate::ADAPTIVE_VIDEO_QUEUE_CAPACITY {
+                        if let Some(evicted) = rolling.pop_front() {
+                            compare(evicted, &mut compared, &mut compared_psnr);
+                        }
+                    }
+                }
+                if produced == 0 {
+                    break;
+                }
+            }
+        }
+        let _ = decoder.drain();
+        loop {
+            let produced = decoder.poll(&mut output).expect("motion clip final poll");
+            while let Some(frame) = output.pop_front() {
+                rolling.push_back(frame);
+                while rolling.len() > crate::ADAPTIVE_VIDEO_QUEUE_CAPACITY {
+                    if let Some(evicted) = rolling.pop_front() {
+                        compare(evicted, &mut compared, &mut compared_psnr);
+                    }
+                }
+            }
+            if produced == 0 {
+                break;
+            }
+        }
+        while let Some(frame) = rolling.pop_front() {
+            compare(frame, &mut compared, &mut compared_psnr);
+        }
+        software.finish();
+        assert_eq!(
+            compared, expected,
+            "{name}: every frame must be compared (software or ours ended early)"
+        );
+        let worst = compared_psnr.iter().copied().fold(f64::INFINITY, f64::min);
+        video_log!(
+            "D3D11VA motion PSNR {name}: frames={} min={worst:.2} dB mean={:.2} dB",
+            compared,
+            compared_psnr.iter().sum::<f64>() / compared as f64
+        );
+    }
+
+    /// Step3 (directive): decode a motion clip on a worker thread while this
+    /// thread continuously converts/copies Y410 on the same device — the
+    /// live Qt render thread versus the D3D11VA decoder worker split, which
+    /// single-threaded tests cannot see. Per-frame PSNR against software must
+    /// stay >= 50 dB and the converted output must equal the plain-texture
+    /// oracle; without the shared immediate-context lock this fails (the
+    /// live-only block smear).
+    #[test]
+    fn d3d11va_concurrent_decode_and_present_match_software_psnr_ge_50db() {
+        let _watchdog = Watchdog::arm("concurrent decode+present", 600);
+        let _runtime = EmbeddedMediaRuntime::initialize().expect("Media Foundation");
+        let mut device: Option<ID3D11Device> = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .expect("D3D11 hardware device");
+        }
+        let device = device.unwrap();
+        let context = context.unwrap();
+        let format = VideoFormat {
+            width: 5120,
+            height: 2880,
+            pixel_format: VideoPixelFormat::Y410,
+            chroma_format: VideoChromaFormat::Cs444,
+            transfer_function: VideoTransferFunction::Pq,
+            color_primaries: crate::VideoColorPrimaries::Bt2020,
+            color_matrix: VideoColorMatrix::Bt2020,
+            ..color_test_format()
+        };
+        format.validate().expect("5K HDR 4:4:4 format");
+        for (name, clip) in [
+            (
+                "bf0",
+                &include_bytes!("../../fixtures/probe/hevc-y410-5k-motion-bf0.hevc")[..],
+            ),
+            (
+                "bf2",
+                &include_bytes!("../../fixtures/probe/hevc-y410-5k-motion-bf2.hevc")[..],
+            ),
+        ] {
+            verify_concurrent(name, clip, &device, &context, format);
+        }
+    }
+
+    fn verify_concurrent(
+        name: &str,
+        clip: &[u8],
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        format: VideoFormat,
+    ) {
+        let mut resources = unsafe {
+            AdoptedResources::new(
+                AdoptedD3d11Context {
+                    device: device.as_raw(),
+                    immediate_context: context.as_raw(),
+                },
+                format,
+            )
+        }
+        .unwrap();
+        let units = annexb_access_units(clip);
+        let expected = units.len();
+        assert!(expected >= 40, "{name}: clip must carry inter frames");
+        let mut software = SoftwareReference::spawn(clip, name);
+
+        let decoder = super::super::d3d11va::D3d11vaDecoder::new(
+            &resources,
+            format,
+            WindowsDecoderMode::Hardware,
+        )
+        .expect("D3D11VA decoder for the concurrent clip");
+        // Bounded channel mirrors the live presenter queue depth so lease
+        // pressure matches a real session.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<
+            super::super::decoder::DecodedVideoFrame,
+        >(crate::ADAPTIVE_VIDEO_QUEUE_CAPACITY);
+        // SAFETY (same argument as SendDecoder): every frame this test moves
+        // is a D3D11VA frame with `_sample: None`, so no COM object actually
+        // crosses threads.
+        struct SendSender(std::sync::mpsc::SyncSender<super::super::decoder::DecodedVideoFrame>);
+        unsafe impl Send for SendSender {}
+        impl SendSender {
+            fn send(&self, frame: super::super::decoder::DecodedVideoFrame) {
+                let _ = self.0.send(frame);
+            }
+        }
+        let sender = SendSender(sender);
+        let work = units
+            .iter()
+            .enumerate()
+            .map(|(index, (unit, irap))| (unit.to_vec(), *irap, index as i64 * (10_000_000 / 120)))
+            .collect::<Vec<_>>();
+        // SAFETY: the decoder is used only by the worker thread after the
+        // move; the device is multithread-protected and FFmpeg's immediate
+        // context callbacks take the shared lock, which is exactly the
+        // cross-thread condition production relies on.
+        struct SendDecoder(super::super::d3d11va::D3d11vaDecoder);
+        unsafe impl Send for SendDecoder {}
+        impl SendDecoder {
+            fn into_inner(self) -> super::super::d3d11va::D3d11vaDecoder {
+                self.0
+            }
+        }
+        let decoder = SendDecoder(decoder);
+        let worker = std::thread::spawn(move || {
+            let mut decoder = decoder.into_inner();
+            for (index, (unit, irap, timestamp)) in work.into_iter().enumerate() {
+                decoder
+                    .submit(EncodedVideoFrame {
+                        codec: crate::VideoCodec::H265,
+                        data: unit,
+                        timestamp_100ns: timestamp,
+                        duration_100ns: 10_000_000 / 120,
+                        key_frame: irap,
+                        reset_decoder: false,
+                    })
+                    .expect("concurrent decode submit");
+                let mut output = VecDeque::new();
+                loop {
+                    let produced = decoder.poll(&mut output).expect("concurrent decode poll");
+                    while let Some(frame) = output.pop_front() {
+                        sender.send(frame);
+                    }
+                    let _ = index;
+                    if produced == 0 {
+                        break;
+                    }
+                }
+            }
+            let _ = decoder.drain();
+            let mut output = VecDeque::new();
+            loop {
+                let produced = decoder.poll(&mut output).expect("concurrent final poll");
+                while let Some(frame) = output.pop_front() {
+                    sender.send(frame);
+                }
+                if produced == 0 {
+                    break;
+                }
+            }
+            decoder.stop();
+        });
+
+        for index in 0..expected {
+            let frame = receiver
+                .recv_timeout(std::time::Duration::from_secs(120))
+                .unwrap_or_else(|_| panic!("{name}: frame {index} was never decoded"));
+            let pixels = readback_y410(device, context, &frame);
+            let software_pixels = software
+                .next_frame()
+                .expect("software reference frame available");
+            let (combined, planes) = motion_frame_psnr(&pixels, software_pixels);
+            if combined < 50.0 {
+                panic!(
+                    "{name} concurrent frame {} below 50 dB: combined={combined:.2} dB \
+                     planes[Y={:.2} U={:.2} V={:.2}] dB",
+                    index, planes[0], planes[1], planes[2]
+                );
+            }
+            // Convert on this thread while the worker decodes the next
+            // frames: the live render-vs-decoder overlap on one device.
+            let reference_texels = planar10_to_y410(software_pixels);
+            let reference_texture = create_y410_upload(device, &reference_texels);
+            let reference_frame = DecodedVideoFrame {
+                format: frame.format,
+                aperture: frame.aperture,
+                texture: reference_texture,
+                subresource: 0,
+                timestamp_100ns: frame.timestamp_100ns,
+                duration_100ns: frame.duration_100ns,
+                _sample: None,
+                #[cfg(feature = "nvdec-gpu-interop")]
+                gpu_planes: None,
+                #[cfg(feature = "nvdec-experiment")]
+                _lease: None,
+            };
+            let recorded_ours = resources
+                .record((index as u32) % 4, &frame)
+                .expect("concurrent record of decoded frame");
+            let recorded_reference = resources
+                .record(((index as u32) + 4) % 4, &reference_frame)
+                .expect("concurrent record of reference frame");
+            drop(frame);
+            let ours_texture =
+                ManuallyDrop::new(unsafe { ID3D11Texture2D::from_raw(recorded_ours.texture) });
+            let reference_out =
+                ManuallyDrop::new(unsafe { ID3D11Texture2D::from_raw(recorded_reference.texture) });
+            let ours_rgb = readback_texels(context, &ours_texture, 0, 5120, 2880);
+            let reference_rgb = readback_texels(context, &reference_out, 0, 5120, 2880);
+            if ours_rgb != reference_rgb {
+                let mismatch = ours_rgb
+                    .iter()
+                    .zip(&reference_rgb)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0);
+                panic!(
+                    "{name} concurrent frame {}: converted output diverges at texel {} \
+                     decoded={:#010x} reference={:#010x} — immediate-context race",
+                    index, mismatch, ours_rgb[mismatch], reference_rgb[mismatch]
+                );
+            }
+        }
+        worker.join().expect("decode worker");
+        software.finish();
+        assert_eq!(
+            receiver.iter().count(),
+            0,
+            "{name}: every decoded frame was consumed exactly once"
+        );
     }
 
     fn color_test_format() -> VideoFormat {

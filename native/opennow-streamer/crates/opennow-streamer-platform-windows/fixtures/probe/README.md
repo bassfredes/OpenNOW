@@ -153,3 +153,25 @@ SHA256: `a117e1079704f6c72aab344de0b712f03338a904d1b595d1bfbd8e9737fc8082`.
 Decoding this stream through D3D11VA requires the patched FFmpeg SDK (stock
 FFmpeg never offers the D3D11 hardware format for 4:4:4 HEVC): see
 `native/opennow-streamer/vendor/patches/ffmpeg-d3d11va-hevc-444.patch`.
+
+## 5K HDR 4:4:4 motion clips (reference-integrity regression)
+
+`hevc-y410-5k-motion-bf0.hevc` (782,042 bytes) and
+`hevc-y410-5k-motion-bf2.hevc` (513,094 bytes) are real-motion 5120x2880
+10-bit 4:4:4 RExt clips (60 frames each, 0.5 s at 120 fps, `testsrc2`
+source, `-g 120`, `-refs 16`, `bf 0` and `bf 2`) encoded with the NVENC
+build in `deps/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0`. Unlike the flat fixtures
+they exercise P/B inter-prediction and several references, which is what
+the live block-smear regression needed. The offline PSNR test decodes each
+clip through D3D11VA and through FFmpeg software and requires >= 50 dB on
+every frame; encode quality is irrelevant to that metric (both sides decode
+the same bits). Raw intermediates stay in `..\tmp-fixtures\`.
+
+```sh
+ffmpeg -f lavfi -i "testsrc2=size=5120x2880:rate=120,format=yuv444p10le" \
+  -t 0.5 -c:v hevc_nvenc -profile:v rext -pix_fmt yuv444p10le -g 120 \
+  -refs 16 -bf 0 hevc-y410-5k-motion-bf0.hevc
+# and -bf 2 for hevc-y410-5k-motion-bf2.hevc
+```
+
+SHA256: bf0 `6ff91a760b0aefdba14197e31909c6b706fd24f9435d8b3ff781f379a95a288a`, bf2 `316452e80043ccd50248729997ebc11931176c49cbdebb3e0aa5b149e9af607d`.

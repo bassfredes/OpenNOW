@@ -229,6 +229,13 @@ impl Y410Converter {
         if slot >= MAX_FRAME_SLOTS || frame.format != self.format {
             return Err("Y410 converter frame or slot mismatch".to_owned());
         }
+        // Serialize with the D3D11VA decoder's device callbacks (the shared
+        // immediate-context lock): the render-thread conversion must never
+        // interleave its copy/draw/execute with worker-thread decode
+        // submissions — the live-only block-smear hypothesis. Offline tests
+        // run single-threaded and cannot see that race.
+        #[cfg(feature = "nvdec-experiment")]
+        let _shared_context_lock = super::d3d11va::SharedContextLock::acquire();
         if self.slots[slot].is_none() {
             let mut texture = None;
             let mut view = None;

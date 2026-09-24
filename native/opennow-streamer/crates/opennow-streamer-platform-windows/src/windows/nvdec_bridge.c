@@ -300,6 +300,33 @@ static void on_d3d11va_error(char *errbuf, int errbuf_len,
     snprintf(errbuf, (size_t)errbuf_len, "%s: %s", what, detail);
 }
 
+/* Shared recursive lock bridging FFmpeg's D3D11VA device callbacks and the
+ * render-side Y410 conversion. AVD3D11VADeviceContext requires a RECURSIVE
+ * lock; a CRITICAL_SECTION provides it, and the single process-wide instance
+ * lets both sides serialize immediate-context work (FFmpeg's default lock
+ * would only serialize FFmpeg's own calls, not Qt's render thread). */
+static INIT_ONCE g_opennow_d3d11_lock_init = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_opennow_d3d11_lock;
+
+static BOOL CALLBACK on_d3d11va_init_lock(PINIT_ONCE once, PVOID param, PVOID *context) {
+    (void)once; (void)param; (void)context;
+    InitializeCriticalSection(&g_opennow_d3d11_lock);
+    return TRUE;
+}
+
+void on_d3d11va_lock(void *ctx) {
+    EnterCriticalSection((CRITICAL_SECTION *)ctx);
+}
+
+void on_d3d11va_unlock(void *ctx) {
+    LeaveCriticalSection((CRITICAL_SECTION *)ctx);
+}
+
+void *on_d3d11va_shared_lock_ctx(void) {
+    InitOnceExecuteOnce(&g_opennow_d3d11_lock_init, on_d3d11va_init_lock, NULL, NULL);
+    return &g_opennow_d3d11_lock;
+}
+
 /* Shares the caller's ID3D11Device (AddRef'd; released with the hw device
  * context). Returns NULL with errbuf describing the failure so the Rust
  * side can log it and fall back to the NVDEC path. */
@@ -334,6 +361,14 @@ OND3d11va *on_d3d11va_open(void *device, int width, int height, int depth,
      * protected) immediate context Qt presents from. */
     ID3D11Device_AddRef((ID3D11Device *)device);
     d3d->device = (ID3D11Device *)device;
+    /* Serialize every immediate-context use with the render side: the same
+     * recursive lock is taken around the Qt Y410 conversion copy/draw/execute
+     * (see on_d3d11va_shared_lock_ctx), so decoder submissions on the worker
+     * thread and the render thread can never interleave on the shared
+     * context — the live-only block-smear hypothesis. */
+    d3d->lock = on_d3d11va_lock;
+    d3d->unlock = on_d3d11va_unlock;
+    d3d->lock_ctx = on_d3d11va_shared_lock_ctx();
     int result = av_hwdevice_ctx_init(hwref);
     if (result < 0) {
         av_buffer_unref(&hwref);
@@ -362,6 +397,12 @@ OND3d11va *on_d3d11va_open(void *device, int width, int height, int depth,
     d->ctx->thread_count = 1;
     d->ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     d->ctx->pkt_timebase = (AVRational){1, 1000000};
+    /* The default pool is 1 base + 16 reference surfaces for HEVC, which
+     * only covers the DPB. Every frame we hand to the presenter holds its
+     * pool slot (the lease), so the pool must also cover the presenter
+     * queue and the reorder tail: 16 extra surfaces keep DPB + leases from
+     * ever exhausting, which would drop reference frames and smear blocks. */
+    d->ctx->extra_hw_frames = 16;
     result = avcodec_open2(d->ctx, codec, NULL);
     if (result < 0) {
         on_d3d11va_error(errbuf, errbuf_len, "avcodec_open2", result);

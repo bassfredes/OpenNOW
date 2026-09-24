@@ -12,7 +12,7 @@ use ::windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_Y410, DXGI_SAMPLE_DESC,
 };
 use ::windows::core::Interface;
-use std::{collections::VecDeque, ffi::c_void, ptr::NonNull};
+use std::{collections::VecDeque, ffi::c_void, fs::OpenOptions, io::Write, ptr::NonNull};
 
 #[repr(C)]
 #[derive(Default)]
@@ -192,6 +192,7 @@ impl Decoder {
         }
     }
     pub(super) fn submit(&mut self, frame: EncodedVideoFrame) -> Result<(), String> {
+        dump_received_access_unit(&frame);
         match self {
             Self::Mf(d) => d.submit(frame),
             Self::Nv(d) => d.submit(frame),
@@ -298,6 +299,19 @@ impl Decoder {
                     .ok_or_else(|| "NVDEC probe returned no frame".into())
             }
         }
+    }
+}
+
+/// `OPENNOW_DUMP_HEVC=<path>` (off unless set): append every access unit the
+/// live decoder receives as raw Annex-B, so a real seat stream can be saved
+/// during a session and replayed or diffed offline. The environment is read
+/// per frame on purpose — no cached state a test could poison.
+fn dump_received_access_unit(frame: &EncodedVideoFrame) {
+    let Some(path) = std::env::var_os("OPENNOW_DUMP_HEVC").filter(|path| !path.is_empty()) else {
+        return;
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(&frame.data);
     }
 }
 
@@ -702,6 +716,51 @@ pub(super) fn decoded_color(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `OPENNOW_DUMP_HEVC` must stay off by default and, when set, append
+    /// the raw Annex-B access units in order so a live seat stream can be
+    /// replayed offline.
+    #[test]
+    fn opennow_dump_hevc_appends_raw_access_units_only_when_enabled() {
+        let path = std::env::temp_dir().join(format!(
+            "opennow-dump-test-{}-{:#x}.hevc",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let previous = std::env::var_os("OPENNOW_DUMP_HEVC");
+        unsafe { std::env::remove_var("OPENNOW_DUMP_HEVC") };
+        let unit = |bytes: &[u8]| EncodedVideoFrame {
+            codec: VideoCodec::H265,
+            data: bytes.to_vec(),
+            timestamp_100ns: 0,
+            duration_100ns: 1,
+            key_frame: true,
+            reset_decoder: false,
+        };
+        let first = [0, 0, 0, 1, 0x40, 1, 0xAA];
+        let second = [0, 0, 1, 0x02, 0x01, 0xBB, 0xCC];
+        dump_received_access_unit(&unit(&first));
+        assert!(
+            !path.exists(),
+            "the dump must stay off when OPENNOW_DUMP_HEVC is unset"
+        );
+        unsafe { std::env::set_var("OPENNOW_DUMP_HEVC", &path) };
+        dump_received_access_unit(&unit(&first));
+        dump_received_access_unit(&unit(&second));
+        let written = std::fs::read(&path).expect("dump file written");
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(&second);
+        assert_eq!(written, expected, "raw Annex-B units appended in order");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("OPENNOW_DUMP_HEVC", &value) },
+            None => unsafe { std::env::remove_var("OPENNOW_DUMP_HEVC") },
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Sample values for the Y410 conversion shift: MSB (left)-aligned
     /// formats — including the rebuilt FFmpeg's `yuv444p10msb` /

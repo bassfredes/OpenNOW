@@ -132,6 +132,30 @@ unsafe extern "C" {
         info: *mut FrameInfo,
     ) -> i32;
     fn on_d3d11va_release_lease(lease: *mut c_void);
+    fn on_d3d11va_lock(ctx: *mut c_void);
+    fn on_d3d11va_unlock(ctx: *mut c_void);
+    fn on_d3d11va_shared_lock_ctx() -> *mut c_void;
+}
+
+/// Render-side hold of the shared immediate-context lock: the D3D11VA
+/// device callbacks take the same lock, so a full Y410 conversion (copy,
+/// draw, execute) can never interleave with decoder submissions from the
+/// worker thread on the shared immediate context — the live-only
+/// block-smear hypothesis. Released on drop.
+pub(super) struct SharedContextLock(*mut c_void);
+
+impl SharedContextLock {
+    pub(super) fn acquire() -> Self {
+        let context = unsafe { on_d3d11va_shared_lock_ctx() };
+        unsafe { on_d3d11va_lock(context) };
+        Self(context)
+    }
+}
+
+impl Drop for SharedContextLock {
+    fn drop(&mut self) {
+        unsafe { on_d3d11va_unlock(self.0) };
+    }
 }
 
 /// Pins one decoded frame's slot in FFmpeg's hardware pool: the presentation
@@ -189,6 +213,22 @@ impl D3d11vaDecoder {
         let video_device: ID3D11VideoDevice = device
             .cast()
             .map_err(|error| format!("ID3D11VideoDevice cast: {error}"))?;
+        // The render thread shares this device's immediate context; D3D11
+        // only serializes per-context commands when multithread protection
+        // is on. Adopted resources enable it — verify again right before the
+        // D3D11VA hardware device starts submitting from this thread.
+        unsafe {
+            let immediate = device
+                .GetImmediateContext()
+                .map_err(|error| format!("GetImmediateContext: {error}"))?;
+            let multithread: ::windows::Win32::Graphics::Direct3D10::ID3D10Multithread = immediate
+                .cast()
+                .map_err(|error| format!("ID3D10Multithread cast: {error}"))?;
+            let _ = multithread.SetMultithreadProtected(true);
+            if !multithread.GetMultithreadProtected().as_bool() {
+                return Err("shared D3D11 context rejected multithread protection".to_owned());
+            }
+        }
         let capability = probe_hevc_444_support(&video_device);
         let supported = match depth {
             10 => capability.main10_444_y410,
