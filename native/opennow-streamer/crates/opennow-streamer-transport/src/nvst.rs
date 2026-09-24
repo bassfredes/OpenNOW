@@ -6077,27 +6077,25 @@ fn run_nvst_webrtc_bundle(
     // socket is readable, and a queued command wakes the poll with an OS event
     // (IOCP on Windows) instead of depending on a UDP loopback datagram or the
     // ~15.6 ms recv-timeout tick that made an un-woken wait cost ~12 ms.
+    //
+    // ONE owner for the registered source: on Windows, mio readiness is
+    // edge-style over AFD and only re-arms when an operation on the
+    // REGISTERED source returns WouldBlock. Reading through a clone (or any
+    // other handle) would consume datagrams without re-arming, and no further
+    // READABLE event would ever fire — ICE would stall after the first burst.
+    // The socket is converted in place and every recv and send below goes
+    // through this mio socket; the drain loop hits WouldBlock on it, which is
+    // what re-arms readiness for the next burst.
     if let Err(error) = socket.set_nonblocking(true) {
         log_udp_error("bundle-nonblocking", local_port, &error);
         eprintln!("NVST UDP nonblocking configuration failed: {error}");
         forward_optional(&event_sender, receiver.stop());
         return;
     }
-    // mio needs its own Source handle; the clone shares the exact socket with
-    // the std handle the worker keeps reading and writing. It must outlive the
-    // receive loop or the registration would be dropped with it.
-    let mut poll_source = match socket.try_clone() {
-        Ok(cloned) => mio::net::UdpSocket::from_std(cloned),
-        Err(error) => {
-            log_udp_error("bundle-poll-source", local_port, &error);
-            eprintln!("NVST WebRTC poll source failed: {error}");
-            forward_optional(&event_sender, receiver.stop());
-            return;
-        }
-    };
+    let mut socket = mio::net::UdpSocket::from_std(socket);
     if let Err(error) =
         poll.registry()
-            .register(&mut poll_source, WORKER_SOCKET_TOKEN, Interest::READABLE)
+            .register(&mut socket, WORKER_SOCKET_TOKEN, Interest::READABLE)
     {
         log_udp_error("bundle-poll-register", local_port, &error);
         eprintln!("NVST WebRTC poll registration failed: {error}");
@@ -11247,6 +11245,64 @@ mod tests {
             latency < Duration::from_millis(1),
             "waker took {latency:?} while poll was blocked"
         );
+    }
+
+    #[test]
+    fn registered_socket_readiness_rearms_across_three_bursts() {
+        // Regression: Windows mio readiness is edge-style over AFD and only
+        // re-arms when a recv on the REGISTERED source returns WouldBlock.
+        // The old code registered a try_clone() while reading the original
+        // handle, so after the first burst no READABLE event ever fired again
+        // (live: bundle inbound=3 STUN then silence, ICE stuck Checking).
+        // Three bursts — each sent only after the previous drain hit
+        // WouldBlock — must all be received within the deadline.
+        let std_socket = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        std_socket.set_nonblocking(true).expect("nonblocking");
+        let mut source = mio::net::UdpSocket::from_std(std_socket);
+        let mut poll = Poll::new().expect("poll");
+        poll.registry()
+            .register(&mut source, WORKER_SOCKET_TOKEN, Interest::READABLE)
+            .expect("register");
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("peer");
+        let target = source.local_addr().expect("local addr");
+        let mut events = Events::with_capacity(4);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        peer.send_to(&[0], target).expect("first burst");
+        for burst in 0..3_u8 {
+            loop {
+                poll.poll(&mut events, Some(Duration::from_millis(250)))
+                    .expect("poll");
+                if events
+                    .iter()
+                    .any(|event| event.token() == WORKER_SOCKET_TOKEN && event.is_readable())
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "burst {burst} never became readable"
+                );
+            }
+            let mut received = 0;
+            let mut buffer = [0_u8; 8];
+            loop {
+                match source.recv_from(&mut buffer) {
+                    Ok((length, _source)) => {
+                        assert_eq!(length, 1);
+                        received += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("recv failed: {error}"),
+                }
+            }
+            assert_eq!(
+                received, 1,
+                "burst {burst} must deliver exactly one datagram after a WouldBlock drain"
+            );
+            if burst < 2 {
+                peer.send_to(&[burst + 1], target).expect("next burst");
+            }
+        }
     }
 
     #[test]
