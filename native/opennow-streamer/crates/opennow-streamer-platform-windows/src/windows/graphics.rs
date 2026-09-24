@@ -471,8 +471,6 @@ impl Graphics {
             full_range: false,
             ..self.video_format
         };
-        let mut decoder =
-            super::decoder::Decoder::new(self, format, crate::WindowsDecoderMode::Hardware)?;
         let data: &[u8] = match (codec, pixel_format, hdr) {
             (VideoCodec::H265, VideoPixelFormat::P010, false) => {
                 include_bytes!("../../fixtures/probe/hevc-p010-sdr.hevc")
@@ -497,11 +495,67 @@ impl Graphics {
             }
             _ => return Err("unsupported Windows decoder probe format".to_owned()),
         };
+        // Real HEVC 4:4:4 is presented zero-copy through the D3D11VA route;
+        // the NVDEC/Media Foundation probe below stays as a fallback and
+        // never gates the 4:4:4 capability flags.
+        if probe_prefers_d3d11va(codec, pixel_format) {
+            #[cfg(feature = "nvdec-experiment")]
+            {
+                match self.probe_d3d11va_444(format, data) {
+                    Ok(()) => {
+                        video_log!(
+                            "Windows format probe passed api=D3d11 codec={} pixelFormat={pixel_format:?} hdr={hdr}: D3D11VA 4:4:4 zero-copy",
+                            codec.label()
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        video_log!(
+                            "D3D11VA 4:4:4 probe unavailable pixelFormat={pixel_format:?} hdr={hdr}: {error}; trying the NVDEC fallback"
+                        );
+                    }
+                }
+            }
+        }
+        let mut decoder =
+            super::decoder::Decoder::new(self, format, crate::WindowsDecoderMode::Hardware)?;
         let frame = decoder.probe_frame(data)?;
         if frame.format.pixel_format != pixel_format
             || frame.format.transfer_function != format.transfer_function
         {
             return Err("decoder did not configure the exact requested probe format".to_owned());
+        }
+        let result = unsafe {
+            super::embedded::probe_decoded_conversion(
+                super::embedded::AdoptedD3d11Context {
+                    device: self.resources.device.as_raw(),
+                    immediate_context: self.resources.context.as_raw(),
+                },
+                &frame,
+            )
+        };
+        drop(frame);
+        decoder.stop();
+        result
+    }
+
+    /// Zero-copy 4:4:4 format probe: `D3d11vaDecoder::new` runs the driver
+    /// capability check (RExt Main_444/Main10_444 profile accepting
+    /// AYUV/Y410) and opens the decoder on the shared D3D11 device; a real
+    /// one-frame decode then proves the exact format before the same
+    /// conversion check every format probe performs.
+    #[cfg(feature = "nvdec-experiment")]
+    fn probe_d3d11va_444(&self, format: VideoFormat, data: &[u8]) -> Result<(), String> {
+        let mut decoder =
+            super::d3d11va::D3d11vaDecoder::new(self, format, crate::WindowsDecoderMode::Hardware)?;
+        let frame = decoder.probe_frame(data)?;
+        if frame.format.pixel_format != format.pixel_format
+            || frame.format.transfer_function != format.transfer_function
+        {
+            decoder.stop();
+            return Err(
+                "D3D11VA decoder did not produce the exact requested probe format".to_owned(),
+            );
         }
         let result = unsafe {
             super::embedded::probe_decoded_conversion(
@@ -1083,6 +1137,18 @@ fn pixel_format_from_dxgi(format: DXGI_FORMAT) -> Option<VideoPixelFormat> {
     }
 }
 
+/// Which probe route the format check takes first: real HEVC 4:4:4
+/// (Y410/AYUV) is presented zero-copy through the D3D11VA route since the
+/// 2026-09-24 regression, while NVDEC/Media Foundation remain fallbacks and
+/// never gate the 4:4:4 capability flags.
+fn probe_prefers_d3d11va(codec: VideoCodec, pixel_format: VideoPixelFormat) -> bool {
+    codec == VideoCodec::H265
+        && matches!(
+            pixel_format,
+            VideoPixelFormat::Y410 | VideoPixelFormat::Ayuv
+        )
+}
+
 fn chroma_format(format: VideoPixelFormat) -> VideoChromaFormat {
     match format {
         VideoPixelFormat::Nv12 | VideoPixelFormat::P010 => VideoChromaFormat::Cs420,
@@ -1302,6 +1368,27 @@ fn fit_rect(input_width: u32, input_height: u32, output_width: u32, output_heigh
 mod tests {
     use super::*;
     use ::windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE;
+
+    /// The startup format probe's H.265 4:4:4 pairs (Y410 with hdr true and
+    /// false, plus Ayuv) must go through the zero-copy D3D11VA route; every
+    /// other pair keeps the plain decoder probe. NVDEC is only a fallback
+    /// and never decides availability on its own.
+    #[test]
+    fn format_probe_routes_hevc_444_pairs_through_d3d11va() {
+        for (codec, pixel, prefers) in [
+            (VideoCodec::H265, VideoPixelFormat::P010, false),
+            (VideoCodec::Av1, VideoPixelFormat::P010, false),
+            (VideoCodec::H264, VideoPixelFormat::Nv12, false),
+            (VideoCodec::H265, VideoPixelFormat::Ayuv, true),
+            (VideoCodec::H265, VideoPixelFormat::Y410, true),
+        ] {
+            assert_eq!(
+                probe_prefers_d3d11va(codec, pixel),
+                prefers,
+                "{codec:?}/{pixel:?}"
+            );
+        }
+    }
 
     fn video_format(pixel_format: VideoPixelFormat) -> VideoFormat {
         VideoFormat {
