@@ -9,6 +9,13 @@ rust-version.workspace = true
 [dependencies]
 opennow-streamer-protocol = { path = "../opennow-streamer-protocol" }
 
+[features]
+nvdec-experiment = []
+nvdec-gpu-interop = ["nvdec-experiment"]
+
+[build-dependencies]
+cc = "1"
+
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

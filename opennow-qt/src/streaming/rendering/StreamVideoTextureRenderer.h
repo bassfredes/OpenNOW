@@ -181,11 +181,13 @@ public:
         if (!enabled || !sdr || !m_fsr.matchesConfiguration(m_rhi, source, target)) {
             m_fsrBinding.reset();
             m_fsrOutputId = 0;
+            m_fsrOutput = nullptr;
         }
         auto *output = m_fsr.render(m_rhi, cb, source, target, enabled, sdr, sharpness);
         if (!output || output == source) {
             m_fsrBinding.reset();
             m_fsrOutputId = 0;
+            m_fsrOutput = nullptr;
             return;
         }
         if (m_fsrBinding && m_fsrOutputId == output->globalResourceId()) return;
@@ -198,6 +200,7 @@ public:
                 QRhiShaderResourceBinding::FragmentStage, output, m_sampler.get())});
         if (!m_fsrBinding->create()) { m_fsrBinding.reset(); return; }
         m_fsrOutputId = output->globalResourceId();
+        m_fsrOutput = output;
     }
 
     void render(QRhiCommandBuffer *cb, bool stencil, int reference)
@@ -207,6 +210,25 @@ public:
                          : m_externalSlot >= 0 ? m_external[m_externalSlot].bindings.get()
                                            : m_imports[m_currentSlot].bindings.get();
         if (!pipeline || !bindings) return;
+        // The fragment shader sizes its downscale footprint from the texel of
+        // the texture actually sampled below (parameters.zw = 1 / sourceSize).
+        // Upload only when that texture's dimensions change.
+        auto *sampled = m_fsrBinding ? m_fsrOutput
+                        : m_externalSlot >= 0
+                            ? m_external[m_externalSlot].texture
+                            : m_imports[m_currentSlot].texture.get();
+        const auto size = sampled ? sampled->pixelSize() : QSize();
+        const float texelW = size.isEmpty() ? 0.0f : 1.0f / float(size.width());
+        const float texelH = size.isEmpty() ? 0.0f : 1.0f / float(size.height());
+        if (texelW != m_texelWidth || texelH != m_texelHeight) {
+            m_texelWidth = texelW;
+            m_texelHeight = texelH;
+            m_composition[26] = texelW;
+            m_composition[27] = texelH;
+            auto *updates = m_rhi->nextResourceUpdateBatch();
+            updates->updateDynamicBuffer(m_uniforms.get(), 104, 8, m_composition.data() + 26);
+            cb->resourceUpdate(updates);
+        }
         cb->setGraphicsPipeline(pipeline);
         cb->setShaderResources(bindings);
         if (stencil) cb->setStencilRef(reference);
@@ -246,6 +268,7 @@ private:
     {
         m_fsrBinding.reset();
         m_fsrOutputId = 0;
+        m_fsrOutput = nullptr;
         m_fsr.release();
     }
 
@@ -306,6 +329,9 @@ private:
     StreamFsrUpscaler m_fsr;
     std::unique_ptr<QRhiShaderResourceBindings> m_fsrBinding;
     quint64 m_fsrOutputId = 0;
+    QRhiTexture *m_fsrOutput = nullptr;
+    float m_texelWidth = 0.0f;
+    float m_texelHeight = 0.0f;
     std::array<std::unique_ptr<QRhiGraphicsPipeline>, 2> m_pipelines;
     std::unique_ptr<QRhiSampler> m_sampler;
     std::unique_ptr<QRhiBuffer> m_uniforms;

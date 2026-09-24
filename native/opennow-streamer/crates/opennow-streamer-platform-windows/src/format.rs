@@ -100,9 +100,11 @@ pub struct VideoFormat {
 impl VideoFormat {
     pub fn validate(self) -> Result<(), BackendError> {
         self.validate_color()?;
-        if !(48..=4096).contains(&self.width) || !(48..=2304).contains(&self.height) {
+        // These are allocation bounds, not a hardware capability claim. The
+        // selected decoder still has to accept the exact negotiated format.
+        if !(48..=7680).contains(&self.width) || !(48..=4320).contains(&self.height) {
             return Err(BackendError::InvalidConfig(format!(
-                "{} dimensions must be at least 48x48 and no larger than 4096x2304",
+                "{} dimensions must be at least 48x48 and no larger than 7680x4320",
                 self.codec.label()
             )));
         }
@@ -530,6 +532,26 @@ mod tests {
         let format = video_format();
         assert!(format.validate().is_ok());
         assert_eq!(format.frame_duration_100ns(), 83_333);
+    }
+
+    #[test]
+    fn high_resolution_dimensions_remain_bounded() {
+        for (width, height, valid) in [
+            (5120, 2880, true),
+            (7680, 4320, true),
+            (7681, 4320, false),
+            (7680, 4321, false),
+            (u32::MAX, 2880, false),
+            (5120, 0, false),
+        ] {
+            let format = VideoFormat {
+                codec: VideoCodec::H265,
+                width,
+                height,
+                ..video_format()
+            };
+            assert_eq!(format.validate().is_ok(), valid, "{width}x{height}");
+        }
     }
 
     #[test]

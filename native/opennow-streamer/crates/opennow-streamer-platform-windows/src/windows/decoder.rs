@@ -4,6 +4,11 @@ use std::mem::ManuallyDrop;
 use std::mem::size_of;
 use std::ptr;
 
+#[cfg(feature = "nvdec-experiment")]
+pub(super) use super::nvdec::Decoder;
+#[cfg(not(feature = "nvdec-experiment"))]
+pub(super) type Decoder = MfDecoder;
+
 use ::windows::Win32::Foundation::{E_NOTIMPL, LUID};
 use ::windows::Win32::Graphics::Direct3D11::{
     D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0, D3D11_DECODER_PROFILE_H264_VLD_FGT,
@@ -76,7 +81,9 @@ pub(super) struct DecodedVideoFrame {
     // Keep it alive through the decoded queue and conversion to Qt's RGB target.
     // See Microsoft's "Supporting Direct3D 11 Video Decoding in Media Foundation",
     // Decoding: the tracked-sample release callback makes the surface reusable.
-    _sample: IMFSample,
+    pub(super) _sample: Option<IMFSample>,
+    #[cfg(feature = "nvdec-gpu-interop")]
+    pub(super) gpu_planes: Option<super::nvdec::GpuPlanes>,
 }
 
 impl DecodedVideoFrame {
@@ -119,12 +126,14 @@ impl DecodedVideoFrame {
             subresource,
             timestamp_100ns,
             duration_100ns,
-            _sample: sample,
+            _sample: Some(sample),
+            #[cfg(feature = "nvdec-gpu-interop")]
+            gpu_planes: None,
         })
     }
 }
 
-pub(super) struct Decoder {
+pub(super) struct MfDecoder {
     events: Option<IMFMediaEventGenerator>,
     transform: IMFTransform,
     activation: IMFActivate,
@@ -139,7 +148,7 @@ pub(super) struct Decoder {
     stopped: bool,
 }
 
-impl Decoder {
+impl MfDecoder {
     pub(super) fn probe<G: DecoderDevice>(
         graphics: &G,
         codec: VideoCodec,
@@ -424,6 +433,7 @@ impl Decoder {
             self.aperture,
             self.negotiated_format.pixel_format,
         )?;
+        super::stage_timing::record_output(frame.timestamp_100ns);
         if decoded_frames.len() == ADAPTIVE_VIDEO_QUEUE_CAPACITY {
             decoded_frames.pop_front();
             let _ = event_queue.push(BackendEvent::QueueOverflow(Subsystem::VideoPresentation));
@@ -474,7 +484,7 @@ enum OutputPoll {
     NeedsInput,
 }
 
-impl Drop for Decoder {
+impl Drop for MfDecoder {
     fn drop(&mut self) {
         self.stop();
     }
@@ -510,6 +520,14 @@ fn configure_transform<G: DecoderDevice>(
         attributes
             .SetUINT32(&MF_LOW_LATENCY, 1)
             .map_err(|error| format!("decoder low-latency mode: {error}"))?;
+        // Evidence that the MFT kept the attribute: Media Foundation silently
+        // ignores unsupported attributes, so a readback is the only way to tell
+        // that the decoder really is in low-latency mode.
+        video_log!(
+            "decoder low-latency attribute set=1 readback={} codec={}",
+            attributes.GetUINT32(&MF_LOW_LATENCY).unwrap_or(0),
+            format.codec.label()
+        );
         if asynchronous {
             attributes
                 .SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)

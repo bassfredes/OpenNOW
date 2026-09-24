@@ -489,15 +489,19 @@ pub(crate) fn server_cursor_messages(bytes: &[u8]) -> Vec<NvstServerCursorMessag
                     normalized,
                 });
             }
-            COMMAND_BITMAP_CURSOR if payload.len() >= 8 => {
-                // Bitmap cursor payloads have a distinct native pixel layout.
-                // Keep detecting them explicitly so they cannot be mistaken for
-                // input/control commands while raw bitmap support is added.
+            COMMAND_BITMAP_CURSOR
+                if payload.len() >= 6
+                    && read_u16_le(payload, 4).is_some_and(|length| {
+                        length == 0 || payload.len() >= 12 + usize::from(length)
+                    }) =>
+            {
+                // Zero-length images are six-byte full-ID cache references.
+                // BitmapCursors owns image validation and stream-scoped caching.
                 updates.push(NvstServerCursorMessage {
                     command: code,
                     offset,
                     raw: bytes[offset..payload_end].to_vec(),
-                    cursor_id: None,
+                    cursor_id: Some(u32::from_le_bytes(payload[..4].try_into().unwrap())),
                     position: None,
                     visible: None,
                     normalized: None,
@@ -1598,7 +1602,7 @@ mod tests {
 
     #[test]
     fn short_cursor_payloads_do_not_consume_following_commands() {
-        for (code, minimum_length) in [(COMMAND_SYSTEM_CURSOR, 4), (COMMAND_BITMAP_CURSOR, 8)] {
+        for (code, minimum_length) in [(COMMAND_SYSTEM_CURSOR, 4), (COMMAND_BITMAP_CURSOR, 6)] {
             for length in 0..minimum_length {
                 let mut bytes = control_command(code, &vec![0x0f; length]);
                 let visible_offset = bytes.len();

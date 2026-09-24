@@ -13,6 +13,9 @@ mod color;
 mod decoder;
 mod embedded;
 mod graphics;
+#[cfg(feature = "nvdec-experiment")]
+mod nvdec;
+mod stage_timing;
 mod y410;
 
 pub(crate) unsafe fn d3d11_adapter_luid(

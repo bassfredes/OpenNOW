@@ -1053,7 +1053,18 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         "a=x-nv-video[0].adaptiveQuantization.perfAdjEnablement:1".to_owned(),
         "a=x-nv-video[0].enableAv1RcPrecisionFactor:1".to_owned(),
         "a=x-nv-video[0].maxNumReferenceFrames:0".to_owned(),
-        "a=x-nv-video[0].prefilterParams.prefilterMode:0".to_owned(),
+        // Official's live 4:4:4 session negotiated prefilter Mode 1
+        // (geronimo 20260924 lines 11321/11279); its captured 4:2:0 announce
+        // carried Mode 2 and every OpenNOW session so far sent Mode 0. Mirror
+        // the official request: Mode 1 for 4:4:4, 0 otherwise.
+        format!(
+            "a=x-nv-video[0].prefilterParams.prefilterMode:{}",
+            if params.stream.color_quality.is_444() {
+                1
+            } else {
+                0
+            }
+        ),
         "a=x-nv-video[0].prefilterParams.prefilterModel:4".to_owned(),
         "a=x-nv-video[0].prefilterParams.denoiseLevel:0".to_owned(),
         "a=x-nv-video[0].prefilterParams.sharpnessLevel:0".to_owned(),
@@ -2142,10 +2153,14 @@ mod tests {
 
     #[test]
     fn full_announce_always_states_depth_chroma_and_hdr_explicitly() {
-        for (codec, color, hdr, depth, chroma) in [
-            ("H265", "10bit_444", false, "10", "3"),
-            ("H265", "10bit_420", false, "10", "1"),
-            ("H264", "8bit_420", false, "8", "1"),
+        for (codec, color, hdr, depth, chroma, profile_block) in [
+            // chromaFormat is 1 for every session: the only value observed
+            // from the official client on the wire (captured 4:2:0 announce
+            // and the live session whose decode was verified Y410). The
+            // 4:4:4-only block mirrors that live session's extra keys.
+            ("H265", "10bit_444", false, "10", "1", true),
+            ("H265", "10bit_420", false, "10", "1", false),
+            ("H264", "8bit_420", false, "8", "1", false),
         ] {
             let mut value = context();
             value.session.extra["negotiatedStreamProfile"]["codec"] = json!(codec);
@@ -2187,6 +2202,30 @@ mod tests {
                     "{codec}/{color}"
                 );
             }
+            // The official live 4:4:4 session carries these; its 4:2:0
+            // capture and every OpenNOW 4:2:0 announce do not.
+            for line in [
+                "a=x-nv-video[0].surfaceFormat:0",
+                "a=x-nv-vqos[0].H265BitStreamProfile:1",
+            ] {
+                assert_eq!(
+                    sdp.contains(line),
+                    profile_block,
+                    "{line} for {codec}/{color}"
+                );
+            }
+            // Prefilter Mode follows the official request: 1 for 4:4:4,
+            // 0 otherwise, exactly once in the body.
+            assert_eq!(
+                sdp_attribute(&sdp, "video[0].prefilterParams.prefilterMode"),
+                Some(if profile_block { "1" } else { "0" }.to_owned())
+            );
+            assert_eq!(
+                sdp.matches("a=x-nv-video[0].prefilterParams.prefilterMode:")
+                    .count(),
+                1,
+                "{codec}/{color}"
+            );
             // Encoder identity the seat reads before initializing.
             for line in [
                 "a=x-nv-video[0].maxCodecProfile:3",

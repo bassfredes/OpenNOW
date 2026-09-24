@@ -46,10 +46,10 @@ use super::nvst_control::{
 use super::nvst_cursor::{CursorCommand, NvstCursorCapture, valid_cursor_channel_message};
 use super::nvst_haptics::NvstHaptics;
 use super::nvst_input::{
-    NvstEncodedInput, NvstInputChannelState, NvstInputChannels, NvstInputCodec, SonyDeviceControl,
-    for_each_sony_output, native_input_type_is_motion, native_input_type_name, native_input_types,
-    next_control_keepalive, server_cursor_messages, sony_device_change_command,
-    sony_report_command,
+    NvstEncodedInput, NvstInputChannelState, NvstInputChannels, NvstInputCodec,
+    NvstServerCursorMessage, SonyDeviceControl, for_each_sony_output, native_input_type_is_motion,
+    native_input_type_name, native_input_types, next_control_keepalive, server_cursor_messages,
+    sony_device_change_command, sony_report_command,
 };
 use super::{
     EncodedMediaFrame, MediaConsumer, TransportError, deliver_media_frame, install_crypto,
@@ -222,8 +222,12 @@ const PING_INTERVAL_BEFORE_CONNECTION: Duration = Duration::from_millis(20);
 const PING_INTERVAL_AFTER_CONNECTION: Duration = Duration::from_millis(100);
 const UDP_RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // The WebRTC bundle owns the SCTP input channels. A 10 ms socket wait batches
-// raw mouse reports and makes high-refresh streams feel closer to 100 Hz.
-const CONTROL_RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+// raw mouse reports and makes high-refresh streams feel closer to 100 Hz, and
+// 1 ms still left an input command waiting out the recv timeout (commands do
+// not wake recv_from): average half a millisecond of avoidable residence.
+// 250 us matches the core input poll floor so the whole client-side input
+// chain stays bounded below one millisecond.
+const CONTROL_RECEIVE_POLL_INTERVAL: Duration = Duration::from_micros(250);
 const STUN_HEADER_LEN: usize = 20;
 const STUN_MAGIC_COOKIE: u32 = 0x2112_a442;
 const STUN_BINDING_REQUEST: u16 = 0x0001;
@@ -264,6 +268,40 @@ fn diagnostic_hex(bytes: &[u8], limit: usize) -> String {
         value.push_str("...");
     }
     value
+}
+
+fn cursor_field<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
+}
+
+/// Payload-free cursor summary for the durable streamer log.
+///
+/// The stderr line beside the call keeps the raw bytes for live evidence
+/// captures. This one carries only discriminators — command, channel, cursor
+/// id, position, visibility and lengths — so a launch without stderr
+/// redirection still records which cursor shapes the seat published, with the
+/// timestamped file sink the transport already uses for pipeline events.
+fn cursor_notification_trace(channel: &str, message: &NvstServerCursorMessage) -> String {
+    format!(
+        "cursor rx channel={channel} command=0x{:04x} offset={} cursorId={} position={} visible={} bytes={}",
+        message.command,
+        message.offset,
+        cursor_field(message.cursor_id),
+        cursor_field(message.position.map(|(x, y)| format!("({x},{y})"))),
+        cursor_field(message.visible),
+        message.raw.len(),
+    )
+}
+
+/// Payload-free summary of the cursor handed to Qt, keyed by normalized type:
+/// `0` is a predefined system id, `1` a pushed image.
+fn cursor_dispatch_trace(channel: &str, cursor: &[u8]) -> String {
+    format!(
+        "cursor dispatch channel={channel} type={} cursorId={} bytes={}",
+        cursor.first().copied().unwrap_or_default(),
+        cursor.get(1).copied().unwrap_or_default(),
+        cursor.len(),
+    )
 }
 
 type Aes256Ctr = Ctr128BE<Aes256>;
@@ -4451,6 +4489,10 @@ enum UdpReceiverCommand {
     Recover,
     SendInput {
         bytes: Vec<u8>,
+        /// Capture time at the FFI submit (queue push). Feeds the input stage
+        /// timings; None only where the origin is not carried by the caller.
+        origin: Option<Instant>,
+        queued_at: Option<Instant>,
         reply: Option<mpsc::SyncSender<Result<(), TransportError>>>,
     },
     Stop,
@@ -4592,6 +4634,8 @@ impl NvstUdpReceiverControl {
         self.commands
             .send(UdpReceiverCommand::SendInput {
                 bytes,
+                origin: None,
+                queued_at: Some(Instant::now()),
                 reply: Some(reply),
             })
             .map_err(|_| TransportError::Closed)?;
@@ -4608,12 +4652,18 @@ impl NvstUdpReceiverControl {
         &self,
         bytes: Vec<u8>,
         _partially_reliable: bool,
+        origin: Instant,
     ) -> Result<(), TransportError> {
         if !self.input_ready.load(Ordering::Acquire) {
             return Err(TransportError::InputNotReady);
         }
         self.commands
-            .send(UdpReceiverCommand::SendInput { bytes, reply: None })
+            .send(UdpReceiverCommand::SendInput {
+                bytes,
+                origin: Some(origin),
+                queued_at: Some(Instant::now()),
+                reply: None,
+            })
             .map_err(|_| TransportError::Closed)
     }
 
@@ -5569,11 +5619,19 @@ fn finish_nvst_input_handshake(
         }
         eprintln!(
             "NVST cursor capture tx: channel={} command=0x0308 enabled=true reason=input-activation",
-            channels.label(channels.control_reliable),
+            channels.label(channels.control_reliable)
         );
         eprintln!(
             "NVST remote cursor tracking tx: channel={} command=0x030d enabled=true reason=input-activation",
-            channels.label(channels.control_reliable),
+            channels.label(channels.control_reliable)
+        );
+        opennow_streamer_protocol::log::log_async(
+            "INFO",
+            "diagnostics",
+            &format!(
+                "cursor tx channel={} command=0x0308 enabled=true reason=input-activation; command=0x030d enabled=true",
+                channels.label(channels.control_reliable)
+            ),
         );
         eprintln!(
             "NVST client state tx: channel={} window_state=19 system_state=0 frame=0",
@@ -5872,6 +5930,14 @@ fn run_nvst_webrtc_bundle(
     let mut last_input_types = Vec::new();
     let mut mouse_motion_packets = 0_u64;
     let mut cursor_capture = NvstCursorCapture::default();
+    let mut bitmap_cursors = super::nvst_bitmap_cursor::BitmapCursors::default();
+    let mut cursor_tracking_refresh = (std::env::var("OPENNOW_CURSOR_TRACKING_REFRESH").as_deref()
+        == Ok("1"))
+    .then(super::nvst_cursor::CursorTrackingRefresh::default);
+    // Built unconditionally so the bounded, payload-free control-header record
+    // reaches the durable sink in every session; the high-frequency stderr
+    // timing output stays gated inside the helpers.
+    let mut input_diagnostics = Some(super::nvst_input_diagnostics::InputDiagnostics::default());
     let mut control_keepalive_at = next_control_keepalive(Instant::now());
     let mut input_timeout_reported = false;
     let mut audio_receiver = NvstAudioReceiver::default();
@@ -5895,7 +5961,18 @@ fn run_nvst_webrtc_bundle(
                         eprintln!("NVST text submission rejected by reliable channel");
                     }
                 }
-                Ok(UdpReceiverCommand::SendInput { bytes, reply }) => {
+                Ok(UdpReceiverCommand::SendInput {
+                    bytes,
+                    origin,
+                    queued_at,
+                    reply,
+                }) => {
+                    let dequeued_at = Instant::now();
+                    if let Some(diagnostics) = &mut input_diagnostics
+                        && let Some(queued_at) = queued_at
+                    {
+                        diagnostics.input(origin, queued_at, dequeued_at);
+                    }
                     if input_state.is_ready()
                         && let Some(channels) = input_channels
                     {
@@ -6023,6 +6100,9 @@ fn run_nvst_webrtc_bundle(
             })
         {
             let _ = event_sender.send(NvstReceiveEvent::CursorCapture(false));
+        }
+        if let (Some(channels), Some(refresh)) = (input_channels, &mut cursor_tracking_refresh) {
+            refresh.update(now, || channels.send_remote_cursor_tracking(&mut rtc, true));
         }
         if input_state.is_ready()
             && let (Some(hid_runtime), Some(hid_session), Some(channels)) =
@@ -6398,6 +6478,9 @@ fn run_nvst_webrtc_bundle(
                             && channels.contains(data.id)
                         {
                             let label = channels.label(data.id);
+                            if let Some(diagnostics) = &mut input_diagnostics {
+                                diagnostics.control(label, &data.data);
+                            }
                             if data.id == channels.control_reliable
                                 || data.id == channels.control_partial
                             {
@@ -6423,7 +6506,18 @@ fn run_nvst_webrtc_bundle(
                                 server_cursor_messages(&data.data)
                             };
                             for message in cursor_messages {
+                                if message.command == 0x010f
+                                    && message.cursor_id == Some(0)
+                                    && let Some(refresh) = &mut cursor_tracking_refresh
+                                {
+                                    refresh.hidden(Instant::now());
+                                }
                                 cursor_capture.notify(Instant::now());
+                                opennow_streamer_protocol::log::log_async(
+                                    "INFO",
+                                    "diagnostics",
+                                    &cursor_notification_trace(label, &message),
+                                );
                                 eprintln!(
                                     "NVST cursor wire rx: channel={label} id={:?} command=0x{:04x} offset={} cursorId={:?} position={:?} visible={:?} bytes={} raw={}",
                                     data.id,
@@ -6435,7 +6529,15 @@ fn run_nvst_webrtc_bundle(
                                     message.raw.len(),
                                     diagnostic_hex(&message.raw, 512),
                                 );
-                                if let Some(cursor) = message.normalized {
+                                let cursor = message
+                                    .normalized
+                                    .or_else(|| bitmap_cursors.normalize(&message.raw));
+                                if let Some(cursor) = cursor {
+                                    opennow_streamer_protocol::log::log_async(
+                                        "INFO",
+                                        "diagnostics",
+                                        &cursor_dispatch_trace(label, &cursor),
+                                    );
                                     eprintln!(
                                         "NVST cursor dispatch: source={label} type={} id={} bytes={} raw={}",
                                         cursor[0],
@@ -6456,6 +6558,16 @@ fn run_nvst_webrtc_bundle(
                                     continue;
                                 }
                                 cursor_capture.notify(Instant::now());
+                                opennow_streamer_protocol::log::log_async(
+                                    "INFO",
+                                    "diagnostics",
+                                    &format!(
+                                        "cursor rx channel={label} bytes={} type={} cursorId={}",
+                                        data.data.len(),
+                                        cursor_field(data.data.first().copied()),
+                                        cursor_field(data.data.get(1).copied()),
+                                    ),
+                                );
                                 eprintln!(
                                     "NVST cursor-channel raw rx: id={:?} bytes={} type={:?} cursorId={:?} raw={}",
                                     data.id,
@@ -6603,6 +6715,11 @@ fn run_nvst_webrtc_bundle(
             }
         };
 
+        // Every input written this iteration has now been packetized by str0m
+        // and handed to the UDP socket inside the poll_output drain above.
+        if let Some(diagnostics) = &mut input_diagnostics {
+            diagnostics.flush(Instant::now());
+        }
         drop(microphone_queue);
         let wait = timeout
             .saturating_duration_since(Instant::now())
@@ -7120,6 +7237,50 @@ fn forward_receive_event(
 mod tests {
     static PREFERRED_NVST_PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The durable cursor trace carries the discriminators the live comparison
+    /// reads — command, channel, id, position, visibility, size — and never the
+    /// payload the stderr line beside it already holds.
+    #[test]
+    fn cursor_notification_trace_carries_discriminators_without_payload() {
+        let raw = [
+            0x0f, 0x01, 0x09, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x80, 0x0a, 0x80, 0x00,
+        ];
+        let messages = super::server_cursor_messages(&raw);
+        assert_eq!(messages.len(), 1);
+        let trace = super::cursor_notification_trace("control_channel_reliable", &messages[0]);
+        assert_eq!(
+            trace,
+            "cursor rx channel=control_channel_reliable command=0x010f offset=0 \
+             cursorId=1 position=(32773,32778) visible=false bytes=13"
+        );
+        assert!(
+            !trace.contains("0f010900"),
+            "trace leaked payload bytes: {trace}"
+        );
+
+        // A four-byte payload carries neither position nor visibility metadata.
+        let bare = [0x0f, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let messages = super::server_cursor_messages(&bare);
+        let trace = super::cursor_notification_trace("control_channel_reliable", &messages[0]);
+        assert_eq!(
+            trace,
+            "cursor rx channel=control_channel_reliable command=0x010f offset=0 \
+             cursorId=0 position=none visible=none bytes=8"
+        );
+
+        // Normalized dispatch: predefined system id and pushed image id.
+        let system = [0, 7, 0, 0, 0, 0, 0];
+        assert_eq!(
+            super::cursor_dispatch_trace("control_channel_reliable", &system),
+            "cursor dispatch channel=control_channel_reliable type=0 cursorId=7 bytes=7"
+        );
+        let image = [1, 0, 3, 4, 9, b'i', b'm'];
+        assert_eq!(
+            super::cursor_dispatch_trace("cursor_channel", &image),
+            "cursor dispatch channel=cursor_channel type=1 cursorId=0 bytes=7"
+        );
+    }
+
     #[test]
     fn typed_text_queue_preserves_order_reservation_and_readiness() {
         use opennow_streamer_protocol::text_input::{TextInputError, TextInputSlot};
@@ -7140,11 +7301,15 @@ mod tests {
         control
             .input_ready
             .store(true, std::sync::atomic::Ordering::Release);
-        control.queue_input(vec![1, 2], false).unwrap();
+        control
+            .queue_input(vec![1, 2], false, Instant::now())
+            .unwrap();
         control
             .queue_text(slot.submit("世界".as_bytes()).unwrap(), 42)
             .unwrap();
-        control.queue_input(vec![3, 4], false).unwrap();
+        control
+            .queue_input(vec![3, 4], false, Instant::now())
+            .unwrap();
         assert_eq!(slot.submit(b"again"), Err(TextInputError::Busy));
         assert!(
             matches!(receiver.try_recv().unwrap(), super::UdpReceiverCommand::SendInput { bytes, .. } if bytes == [1, 2])

@@ -17,6 +17,8 @@
 #include <QWheelEvent>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <utility>
 
@@ -29,6 +31,57 @@
 #endif
 #include <windows.h>
 #endif
+
+namespace {
+
+// Bounded event->submit stage timing for the input path, mirroring the native
+// stage_timing windows: the last 240 samples, one payload-free p50/p95 line
+// every five seconds on stderr. It measures the synchronous GUI-thread leg,
+// handler entry -> FFI submit return. Residence inside the OS message queue
+// before Qt sees the event is not observable in-process; Windows coalesces
+// WM_MOUSEMOVE there for every client, including the official one.
+using InputEventClock = std::chrono::steady_clock;
+constexpr std::size_t InputTimingSamples = 240;
+
+std::array<qint64, InputTimingSamples> g_inputTimingUs{};
+std::size_t g_inputTimingCount = 0;
+std::size_t g_inputTimingNext = 0;
+qint64 g_inputTimingMaxUs = 0;
+InputEventClock::time_point g_inputTimingReportAt{};
+
+InputEventClock::time_point inputEventBegin()
+{
+    const auto now = InputEventClock::now();
+    if (g_inputTimingReportAt.time_since_epoch().count() == 0)
+        g_inputTimingReportAt = now + std::chrono::seconds(5);
+    return now;
+}
+
+void inputEventSubmitted(InputEventClock::time_point begun)
+{
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        InputEventClock::now() - begun)
+                        .count();
+    g_inputTimingUs[g_inputTimingNext] = us;
+    g_inputTimingNext = (g_inputTimingNext + 1) % InputTimingSamples;
+    if (g_inputTimingCount < InputTimingSamples) ++g_inputTimingCount;
+    g_inputTimingMaxUs = std::max(g_inputTimingMaxUs, static_cast<qint64>(us));
+    const auto now = InputEventClock::now();
+    if (now < g_inputTimingReportAt) return;
+    std::array<qint64, InputTimingSamples> sorted{};
+    std::copy_n(g_inputTimingUs.data(), g_inputTimingCount, sorted.data());
+    std::sort(sorted.begin(), sorted.begin() + g_inputTimingCount);
+    const auto count = static_cast<qint64>(g_inputTimingCount);
+    qWarning("input-stage-timings eventToSubmit p50Us=%lld p95Us=%lld maxUs=%lld n=%lld",
+             sorted[(g_inputTimingCount - 1) / 2],
+             sorted[(g_inputTimingCount * 95 + 99) / 100 - 1], g_inputTimingMaxUs, count);
+    g_inputTimingCount = 0;
+    g_inputTimingNext = 0;
+    g_inputTimingMaxUs = 0;
+    g_inputTimingReportAt = now + std::chrono::seconds(5);
+}
+
+} // namespace
 
 quint16 StreamVideoItem::windowsVirtualKey(int key, Qt::KeyboardModifiers modifiers,
                                           quint32 nativeVirtualKey)
@@ -365,6 +418,7 @@ quint8 StreamVideoItem::mouseButton(Qt::MouseButton button)
 
 void StreamVideoItem::mousePressEvent(QMouseEvent *event)
 {
+    const auto timingBegun = inputEventBegin();
     forceActiveFocus(Qt::MouseFocusReason);
     syncCaptureState();
     const auto button = mouseButton(event->button());
@@ -377,6 +431,7 @@ void StreamVideoItem::mousePressEvent(QMouseEvent *event)
             if (!m_rawInputActive) {
                 if (!m_relativeMouse) submitAbsoluteMouse(event->position());
                 s_nativeRuntime->submitMouseButton(button, true);
+                inputEventSubmitted(timingBegun);
             }
         }
         m_lastMousePosition = event->position();
@@ -388,11 +443,13 @@ void StreamVideoItem::mousePressEvent(QMouseEvent *event)
 
 void StreamVideoItem::mouseReleaseEvent(QMouseEvent *event)
 {
+    const auto timingBegun = inputEventBegin();
     const auto button = mouseButton(event->button());
     if (m_captureActive && button != 0) {
         if (m_pressedMouseButtons.remove(button) && !m_rawInputActive) {
             if (!m_relativeMouse) submitAbsoluteMouse(event->position());
             s_nativeRuntime->submitMouseButton(button, false);
+            inputEventSubmitted(timingBegun);
         }
         if (m_pressedMouseButtons.isEmpty() && m_pendingRelativeMouse) {
             const auto relative = *m_pendingRelativeMouse;
@@ -411,6 +468,7 @@ void StreamVideoItem::mouseMoveEvent(QMouseEvent *event)
         event->ignore();
         return;
     }
+    const auto timingBegun = inputEventBegin();
     if (m_relativeMouse) {
         if (!m_rawInputActive && !WaylandPointerCapture::isWayland()
                 && !m_usesMacPointerCapture) {
@@ -423,10 +481,12 @@ void StreamVideoItem::mouseMoveEvent(QMouseEvent *event)
             const auto anchor = mapToGlobal(QPointF(width() / 2.0, height() / 2.0)).toPoint();
             QCursor::setPos(anchor);
             m_lastMousePosition = mapFromGlobal(QCursor::pos());
+            inputEventSubmitted(timingBegun);
         }
     } else {
         submitAbsoluteMouse(event->position());
         m_lastMousePosition = event->position();
+        inputEventSubmitted(timingBegun);
     }
     event->accept();
 }
@@ -440,8 +500,10 @@ void StreamVideoItem::hoverEnterEvent(QHoverEvent *event)
     // QQuickItem sends ordinary no-button movement through hover events once
     // hover delivery is enabled. Publish the entry point as well so the remote
     // cursor cannot retain a stale position when it re-enters the stream item.
+    const auto timingBegun = inputEventBegin();
     submitAbsoluteMouse(event->position());
     m_lastMousePosition = event->position();
+    inputEventSubmitted(timingBegun);
     event->accept();
 }
 
@@ -454,8 +516,10 @@ void StreamVideoItem::hoverMoveEvent(QHoverEvent *event)
     // With no button held Qt does not call mouseMoveEvent for this item. Keep
     // the absolute GFN pointer current so remote hover and click hit-testing
     // use the same coordinates.
+    const auto timingBegun = inputEventBegin();
     submitAbsoluteMouse(event->position());
     m_lastMousePosition = event->position();
+    inputEventSubmitted(timingBegun);
     event->accept();
 }
 
@@ -465,6 +529,7 @@ void StreamVideoItem::wheelEvent(QWheelEvent *event)
         event->ignore();
         return;
     }
+    const auto timingBegun = inputEventBegin();
     if (!m_rawInputActive) {
         if (!m_relativeMouse) submitAbsoluteMouse(event->position());
         const auto delta = event->pixelDelta().isNull() ? event->angleDelta()
@@ -472,6 +537,7 @@ void StreamVideoItem::wheelEvent(QWheelEvent *event)
         s_nativeRuntime->submitMouseWheel(
             static_cast<qint16>(std::clamp(delta.x(), -32768, 32767)),
             static_cast<qint16>(std::clamp(delta.y(), -32768, 32767)));
+        inputEventSubmitted(timingBegun);
     }
     event->accept();
 }
@@ -803,11 +869,47 @@ void StreamVideoItem::updateLocalCursor()
         unsetCursor();
         return;
     }
-    if (m_relativeMouse || (m_serverCursorComposited && m_manualRelativeMouse != false)) {
+    // Known-hidden (the seat reported id 0) blanks the pointer as well: with the
+    // seat silent about a shape, an arrow would float over the game's own
+    // cursor. An *unknown* visibility still shows the last shape, because hiding
+    // on "nothing published" leaves a session with no pointer at all.
+    if (m_relativeMouse
+        || (m_serverCursorComposited && m_manualRelativeMouse != false)
+        || (m_remoteCursorKnown && !m_remoteCursorVisible)) {
         setCursor(Qt::BlankCursor);
         return;
     }
     setCursor(m_remoteCursor);
+}
+
+namespace {
+/// Whether a hidden system cursor must keep absolute input. Default on: the
+/// official client stayed absolute through the recorded Path of Exile 2 session
+/// (`Local cursor: 1 … shouldLock: 0` in geronimo.log.bak) and the OpenNOW-Mac
+/// reference keys input mode on the player's pointer lock, not on the seat's
+/// visibility. Switching to relative hides the host cursor, which is what stops
+/// the seat publishing a shape at all, leaving only the game-drawn cursor in the
+/// video. `OPENNOW_CURSOR_ABSOLUTE_HIDDEN=0` restores lock-on-hidden.
+bool cursorAbsoluteOnHidden()
+{
+    const auto value = qEnvironmentVariable("OPENNOW_CURSOR_ABSOLUTE_HIDDEN");
+    if (value.isEmpty()) return true;
+    return value != QStringLiteral("0")
+        && value.compare(QStringLiteral("false"), Qt::CaseInsensitive) != 0;
+}
+} // namespace
+
+bool StreamVideoItem::relativeInputForRemoteCursor(bool hidden,
+                                                   bool currentRelative,
+                                                   std::optional<bool> manualRelative,
+                                                   bool absoluteOnHidden)
+{
+    if (manualRelative) return *manualRelative;
+    if (!absoluteOnHidden) return hidden;
+    // Stay put while the seat reports hidden: this policy must not *enter*
+    // relative mode, and it must not kick an already-locked input out of it.
+    // A visible cursor still returns to absolute, as before.
+    return hidden ? currentRelative : false;
 }
 
 void StreamVideoItem::resetRemoteCursor()
@@ -839,7 +941,8 @@ void StreamVideoItem::applyRemoteCursor(const QByteArray &bytes)
     const auto metadata = remoteCursorMetadata(bytes);
     m_remoteCursorKnown = true;
     m_remoteCursorVisible = !hidden;
-    setRelativeMouse(m_manualRelativeMouse.value_or(hidden));
+    setRelativeMouse(relativeInputForRemoteCursor(
+        hidden, m_relativeMouse, m_manualRelativeMouse, cursorAbsoluteOnHidden()));
     updateLocalCursor();
     if (hidden) return;
 

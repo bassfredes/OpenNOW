@@ -9,6 +9,10 @@ use std::sync::Mutex;
 
 const SERVICE_NAME: &str = "app.opennow.auth";
 
+#[cfg(windows)]
+#[path = "windows_secret_store.rs"]
+mod windows_secret_store;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedIdentity {
@@ -86,9 +90,15 @@ impl CredentialVault {
         vault
     }
     pub fn new(data_dir: PathBuf) -> Self {
+        #[cfg(windows)]
+        let store: Box<dyn SecretStore> = Box::new(windows_secret_store::WindowsSecretStore::new(
+            data_dir.join("session-vault"),
+        ));
+        #[cfg(not(windows))]
+        let store: Box<dyn SecretStore> = Box::new(OsSecretStore);
         Self {
             metadata_path: data_dir.join("accounts.json"),
-            store: Box::new(OsSecretStore),
+            store,
             warnings: Mutex::new(std::collections::BTreeMap::new()),
             suppressed: Mutex::new(Vec::new()),
         }
@@ -729,6 +739,25 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_large_session_restores_after_reopening_the_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = sample_session(&format!("lab-test-{:016x}", rand::random::<u64>()));
+        session.tokens.access_token = "synthetic-large-access-token".repeat(1024);
+        session.tokens.refresh_token = Some("synthetic-refresh-token".repeat(256));
+        let vault = CredentialVault::new(directory.path().into());
+        vault.save(&session).unwrap();
+        drop(vault);
+        let reopened = CredentialVault::new(directory.path().into());
+        let restored = reopened.load_active().unwrap().expect("persisted account");
+        assert_eq!(restored.tokens.access_token, session.tokens.access_token);
+        assert_eq!(restored.tokens.refresh_token, session.tokens.refresh_token);
+        assert!(reopened.durable(&restored));
+        reopened.remove(&session.user.user_id).unwrap();
+        assert!(reopened.load_active().unwrap().is_none());
+    }
 
     #[test]
     fn secure_restore_survives_failed_legacy_cleanup_and_retries() {

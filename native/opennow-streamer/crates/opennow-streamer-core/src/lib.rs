@@ -109,7 +109,7 @@ trait NvstSessionResources {
     }
     fn request_keyframe(&self);
     fn acknowledge_video_frame(&self, frame_index: u32, bytes: u32);
-    fn send_captured_input(&self, bytes: Vec<u8>) -> Result<(), String>;
+    fn send_captured_input(&self, bytes: Vec<u8>, origin: Instant) -> Result<(), String>;
     fn send_captured_text(
         &self,
         text: opennow_streamer_protocol::text_input::UnicodeText,
@@ -150,9 +150,9 @@ impl NvstSessionResources for ActiveNvstResources {
             .publish_accepted_frame(frame_index, bytes, Instant::now());
     }
 
-    fn send_captured_input(&self, bytes: Vec<u8>) -> Result<(), String> {
+    fn send_captured_input(&self, bytes: Vec<u8>, origin: Instant) -> Result<(), String> {
         self.bundle
-            .queue_input(bytes, false)
+            .queue_input(bytes, false, origin)
             .map_err(|error| error.to_string())
     }
 
@@ -2553,7 +2553,10 @@ fn forward_nvst_captured_input<R: NvstSessionResources>(
     if let CapturedInput::Text(text) = input {
         return resources.send_captured_text(text, timestamp_us);
     }
-    resources.send_captured_input(captured_input_packet(input, timestamp_us))
+    resources.send_captured_input(
+        captured_input_packet(input, timestamp_us),
+        std::time::Instant::now(),
+    )
 }
 
 fn forward_nvst_captured_sample<R: NvstSessionResources>(
@@ -2581,7 +2584,10 @@ fn forward_nvst_captured_sample<R: NvstSessionResources>(
     if let CapturedInput::Text(text) = sample.input {
         return resources.send_captured_text(text, timestamp_us);
     }
-    resources.send_captured_input(captured_input_packet(sample.input, timestamp_us))
+    resources.send_captured_input(
+        captured_input_packet(sample.input, timestamp_us),
+        sample.captured_at,
+    )
 }
 
 fn captured_input_packet(input: CapturedInput, timestamp_us: u64) -> Vec<u8> {
@@ -2765,7 +2771,10 @@ fn media_stream_config(context: &SessionContext) -> MediaStreamConfig {
             let (width, height) = lowercase.split_once('x')?;
             Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?))
         })
-        .filter(|(width, height)| (48..=4096).contains(width) && (48..=2304).contains(height))
+        // Match the application's bounded resolution settings. RTSP announces
+        // the negotiated dimensions; silently reducing 5K to 1080p here makes
+        // the decoder reject every correctly sized frame from that stream.
+        .filter(|(width, height)| (48..=7680).contains(width) && (48..=4320).contains(height))
         .unwrap_or((1920, 1080));
     let fps = context
         .session
@@ -3219,7 +3228,7 @@ mod tests {
                 .push((frame_index, bytes));
         }
 
-        fn send_captured_input(&self, bytes: Vec<u8>) -> Result<(), String> {
+        fn send_captured_input(&self, bytes: Vec<u8>, _origin: Instant) -> Result<(), String> {
             self.captured_inputs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5782,5 +5791,26 @@ mod tests {
             ),
             MediaStreamConfig::default()
         );
+    }
+
+    #[test]
+    fn high_resolution_media_config_preserves_negotiated_dimensions() {
+        for (width, height) in [(5120, 2880), (7680, 4320)] {
+            for negotiated in [false, true] {
+                let resolution = format!("{width}x{height}");
+                let mut context = json!({
+                    "session": { "sessionId": "test", "serverIp": "127.0.0.1" },
+                    "settings": { "resolution": resolution },
+                    "shortcuts": {}
+                });
+                if negotiated {
+                    context["session"]["negotiatedStreamProfile"] =
+                        json!({"resolution": resolution});
+                    context["settings"]["resolution"] = json!("1920x1080");
+                }
+                let config = media_stream_config(&serde_json::from_value(context).unwrap());
+                assert_eq!((config.width, config.height), (width, height));
+            }
+        }
     }
 }

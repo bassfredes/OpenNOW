@@ -846,12 +846,16 @@ impl GfnService {
             } else {
                 PersistenceIntent::MemoryOnly
             };
-            state.persistence_state = if persist && self.vault.save(&session).is_ok() {
-                "secure-store"
-            } else {
-                if !persist {
-                    let _ = self.vault.remove(&session.user.user_id);
+            state.persistence_state = if persist {
+                match self.vault.save(&session) {
+                    Ok(()) => "secure-store",
+                    Err(error) => {
+                        eprintln!("auth: session persistence failed: {error}");
+                        "memory-only"
+                    }
                 }
+            } else {
+                let _ = self.vault.remove(&session.user.user_id);
                 "memory-only"
             }
             .into();

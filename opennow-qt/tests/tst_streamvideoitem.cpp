@@ -590,6 +590,13 @@ private slots:
         StreamVideoItem item;
         const auto hidden = QByteArray::fromHex("0000");
         const auto visible = QByteArray::fromHex("0001");
+        // Default policy: a transient hidden id 0 keeps absolute input, so the
+        // manual lock is what puts this item into relative mode.
+        item.applyRemoteCursor(hidden);
+        QVERIFY(!item.relativeMouse());
+        item.togglePointerLock();
+        QVERIFY(item.relativeMouse());
+        item.applyRemoteCursor(visible);
         item.applyRemoteCursor(hidden);
         QVERIFY(item.relativeMouse());
         item.togglePointerLock();
@@ -597,18 +604,64 @@ private slots:
         item.applyRemoteCursor(visible);
         item.applyRemoteCursor(hidden);
         QVERIFY(!item.relativeMouse());
-        item.releaseInput();
-        item.applyRemoteCursor(hidden);
-        QVERIFY(!item.relativeMouse());
-        item.togglePointerLock();
-        QVERIFY(item.relativeMouse());
-        item.applyRemoteCursor(visible);
-        QVERIFY(item.relativeMouse());
         item.setVisible(false);
         QVERIFY(!item.m_manualRelativeMouse.has_value());
         item.setVisible(true);
         item.applyRemoteCursor(visible);
         QVERIFY(!item.relativeMouse());
+    }
+
+    /// The seat reporting "hidden" no longer switches input to relative/raw, and
+    /// the local pointer still blanks so the game's own cursor stays the only one
+    /// on screen. `OPENNOW_CURSOR_ABSOLUTE_HIDDEN=0` restores the old behaviour.
+    void hiddenSystemCursorKeepsAbsoluteInputUnlessOptedOut()
+    {
+        StreamVideoItem item;
+        const auto hidden = QByteArray::fromHex("0000");
+        const auto visible = QByteArray::fromHex("0001");
+        QVERIFY(qEnvironmentVariableIsSet("OPENNOW_CURSOR_ABSOLUTE_HIDDEN") == false);
+        qunsetenv("OPENNOW_CURSOR_ABSOLUTE_HIDDEN");
+
+        item.applyRemoteCursor(hidden);
+        QVERIFY(!item.relativeMouse());
+        QVERIFY(item.m_remoteCursorKnown);
+        QVERIFY(!item.m_remoteCursorVisible);
+        // Capture active: the pointer is blanked, never drawn over the game's.
+        item.m_captureActive = true;
+        item.m_serverCursorComposited = false;
+        item.updateLocalCursor();
+        QCOMPARE(item.cursor().shape(), Qt::BlankCursor);
+        item.applyRemoteCursor(visible);
+        QVERIFY(!item.relativeMouse());
+        QVERIFY(item.m_remoteCursorVisible);
+        item.updateLocalCursor();
+        QCOMPARE(item.cursor().shape(), item.m_remoteCursor.shape());
+
+        // Manual lock still outranks the seat in both directions.
+        item.togglePointerLock();
+        QVERIFY(item.relativeMouse());
+        item.applyRemoteCursor(hidden);
+        QVERIFY(item.relativeMouse());
+
+        // Opt-out restores lock-on-hidden for a player who wants mouselook deltas.
+        item.releaseInput();
+        item.m_manualRelativeMouse.reset();
+        item.m_relativeMouse = false;
+        item.updateLocalCursor();
+        qputenv("OPENNOW_CURSOR_ABSOLUTE_HIDDEN", QByteArrayLiteral("0"));
+        item.applyRemoteCursor(hidden);
+        QVERIFY(item.relativeMouse());
+        qunsetenv("OPENNOW_CURSOR_ABSOLUTE_HIDDEN");
+
+        // The decision helper states the whole rule for direct callers.
+        QVERIFY(!StreamVideoItem::relativeInputForRemoteCursor(true, false, std::nullopt, true));
+        QVERIFY(StreamVideoItem::relativeInputForRemoteCursor(true, false, std::nullopt, false));
+        QVERIFY(!StreamVideoItem::relativeInputForRemoteCursor(false, false, std::nullopt, true));
+        QVERIFY(!StreamVideoItem::relativeInputForRemoteCursor(true, false, false, false));
+        QVERIFY(StreamVideoItem::relativeInputForRemoteCursor(false, false, true, true));
+        // Hidden leaves an already-locked input alone instead of unlocking it.
+        QVERIFY(StreamVideoItem::relativeInputForRemoteCursor(true, true, std::nullopt, true));
+        item.m_captureActive = false;
     }
 
     void manualPointerUnlockClearsHeldInputAndDeferredMode()
@@ -640,7 +693,10 @@ private slots:
         QCOMPARE(item.cursor().shape(), Qt::ArrowCursor);
         item.m_manualRelativeMouse.reset();
         item.m_serverCursorComposited = false;
+        // Known and visible: applyRemoteCursor always sets both together, so a
+        // known-but-hidden state cannot occur at runtime.
         item.m_remoteCursorKnown = true;
+        item.m_remoteCursorVisible = true;
         item.setRemoteCursorShape(QCursor(Qt::CrossCursor));
         QCOMPARE(item.cursor().shape(), Qt::CrossCursor);
         item.m_relativeMouse = true;
@@ -2319,11 +2375,15 @@ private slots:
         QTRY_VERIFY(item.captureActive());
         session.composition(false);
         QTRY_VERIFY(!item.m_serverCursorComposited);
+        // A hidden seat cursor no longer enters relative mode by itself: enter
+        // the locked state directly and hold it with the pressed buttons, so the
+        // seat updates below are deferred instead of re-modeing the input.
+        item.setRelativeMouse(true);
+        item.m_pressedMouseButtons.insert(1);
+        item.m_pressedMouseButtons.insert(3);
         item.applyRemoteCursor(QByteArray::fromHex("0000"));
         QVERIFY(item.relativeMouse());
         QCOMPARE(item.cursor().shape(), Qt::BlankCursor);
-        item.m_pressedMouseButtons.insert(1);
-        item.m_pressedMouseButtons.insert(3);
         for (const auto &cursor : {"000c", "0002", "0000", "000c"}) {
             item.applyRemoteCursor(QByteArray::fromHex(cursor));
             QVERIFY(item.relativeMouse());
@@ -2360,10 +2420,12 @@ private slots:
         QTRY_VERIFY(!item.m_serverCursorComposited);
         item.applyRemoteCursor(QByteArray::fromHex("0002"));
         QCOMPARE(item.cursor().shape(), Qt::IBeamCursor);
+        // Locked directly (a hidden seat cursor no longer does it), then a held
+        // button defers nothing: the hidden notification leaves the mode alone.
+        item.setRelativeMouse(true);
         item.m_pressedMouseButtons.insert(1);
         item.applyRemoteCursor(QByteArray::fromHex("0000"));
-        QVERIFY(!item.relativeMouse());
-        QCOMPARE(item.cursor().shape(), Qt::IBeamCursor);
+        QVERIFY(item.relativeMouse());
         item.releaseInput();
         QVERIFY(item.relativeMouse());
         QCOMPARE(item.cursor().shape(), Qt::ArrowCursor);
@@ -2406,8 +2468,9 @@ private slots:
         QTRY_VERIFY(item.captureActive());
         session.composition(false);
         QTRY_VERIFY(!item.m_serverCursorComposited);
-        item.applyRemoteCursor(QByteArray::fromHex("0000"));
+        item.setRelativeMouse(true);
         item.m_pressedMouseButtons.insert(1);
+        item.applyRemoteCursor(QByteArray::fromHex("0000"));
         item.applyRemoteCursor(message);
         QVERIFY(item.relativeMouse());
         QCOMPARE(item.cursor().shape(), Qt::BlankCursor);

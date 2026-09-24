@@ -353,6 +353,12 @@ QtObject {
     property var streamDropCounts: ({})
     onActiveSessionChanged: {
         const sessionId = String(activeSession && activeSession.sessionId || "")
+        if (sessionId !== streamLifecycleSessionId) {
+            const requestId = streamLifecycleRequestId
+            streamLifecycleRequestId = ""
+            streamLifecycleSessionId = ""
+            if (requestId !== "") CoreClient.cancel(requestId)
+        }
         if (sessionId !== colorFormatSessionId) {
             colorFormatSessionId = sessionId
             streamRequestedColorQuality = ""
@@ -646,6 +652,8 @@ QtObject {
     property bool sessionClaimIsRecovery: false
     property string streamCreateRequestId: ""
     property string streamPollRequestId: ""
+    property string streamLifecycleRequestId: ""
+    property string streamLifecycleSessionId: ""
     property string streamStopRequestId: ""
     property string streamerStartRequestId: ""
     property string streamerPrepareRequestId: ""
@@ -848,6 +856,15 @@ QtObject {
         repeat: true
         running: root.signedIn && AppController.route !== "stream"
         onTriggered: root.refreshRemoteSessions()
+    }
+
+    property Timer streamLifecycleTimer: Timer {
+        interval: 3000
+        repeat: true
+        running: root.ready && root.activeSession && root.streamer
+            && root.streamer.status === "streaming" && !root.sessionRecoveryPending
+            && !root.streamerStopExpected && root.streamStopRequestId === ""
+        onTriggered: root.pollActiveSessionLifecycle()
     }
 
     property Timer antiAfkPulseTimer: Timer {
@@ -2551,6 +2568,37 @@ QtObject {
         accessibilityMessage = mediaMessage
     }
 
+    function pollActiveSessionLifecycle() {
+        if (!ready || !activeSession || !streamer || streamer.status !== "streaming"
+                || sessionRecoveryPending || streamerStopExpected || streamStopRequestId !== ""
+                || streamLifecycleRequestId !== "") return
+        streamLifecycleSessionId = String(activeSession.sessionId || "")
+        if (streamLifecycleSessionId === "") return
+        // Observe the cloud seat without changing the active media snapshot.
+        // A lost input channel or missing video alone does not prove game exit.
+        streamLifecycleRequestId = CoreClient.request("session.poll", {
+            sessionId: streamLifecycleSessionId,
+            streamingBaseUrl: activeSession.streamingBaseUrl,
+            recoveryMode: true
+        }, 10000)
+    }
+
+    function acceptSessionLifecycleResponse(requestId, result) {
+        if (requestId === "" || requestId !== streamLifecycleRequestId) return false
+        const sessionId = streamLifecycleSessionId
+        streamLifecycleRequestId = ""
+        streamLifecycleSessionId = ""
+        if (!result || !result.scope || !activeSession || String(activeSession.sessionId) !== sessionId
+                || !acceptsSessionScope(result.scope)) return true
+        const session = result.session
+        const termination = result.termination || (session && Number(session.status) === 7
+            && String(session.sessionId) === sessionId
+            ? {source: "cloudmatch-session-status", status: 7, sessionId: sessionId, resumable: false} : null)
+        if (isRemoteSessionTermination(termination) && String(termination.sessionId) === sessionId)
+            finishRemoteSession(termination)
+        return true
+    }
+
     function pollStreamingSession() {
         if (!ready || !activeSession || streamPollRequestId !== "" || streamStopRequestId !== "")
             return
@@ -3099,6 +3147,7 @@ QtObject {
         } else if (type === "input-unavailable") {
             fields.inputReady = false
             fields.inputUnavailableReason = String(event.reason || "")
+            pollActiveSessionLifecycle()
         } else if (type === "microphone-state") {
             fields.microphoneState = ["disabled", "muted", "ready", "unavailable", "error"]
                 .indexOf(String(event.state)) >= 0 ? String(event.state) : "error"
@@ -3219,6 +3268,8 @@ QtObject {
             }
         }
         function onResponseReceived(requestId, result) {
+            if (requestId === root.streamLifecycleRequestId
+                    && root.acceptSessionLifecycleResponse(requestId, result)) return
             if (settingsOwner.acceptResponse(requestId, result)) return
             const ownedTermination = root.ownedSessionTermination(result)
             if (ownedTermination) {
@@ -3623,6 +3674,8 @@ QtObject {
             }
         }
         function onRequestFailed(requestId, code, message) {
+            if (requestId === root.streamLifecycleRequestId
+                    && root.acceptSessionLifecycleResponse(requestId, null)) return
             if (settingsOwner.acceptFailure(requestId, message)) return
             if (onboardingOwner.acceptFailure(requestId, message)) {
                 return

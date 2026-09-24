@@ -4,6 +4,42 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_ATTEMPTS: u8 = 8;
 const SILENT_HOST_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Opt-in negotiation probe: reassert tracking once on the first hidden cursor.
+/// It never disables tracking or changes cursor shape/input mode. Failed local
+/// queue admission gets at most three attempts; a successful enqueue ends it.
+#[derive(Default)]
+pub(crate) struct CursorTrackingRefresh {
+    started: bool,
+    due: Option<Instant>,
+    attempts: u8,
+}
+
+impl CursorTrackingRefresh {
+    pub(crate) fn hidden(&mut self, now: Instant) {
+        if !self.started {
+            self.started = true;
+            self.due = Some(now);
+        }
+    }
+
+    pub(crate) fn update(&mut self, now: Instant, mut send: impl FnMut() -> bool) {
+        if !self.due.is_some_and(|due| now >= due) {
+            return;
+        }
+        self.attempts += 1;
+        let queued = send();
+        eprintln!(
+            "NVST cursor tracking refresh: command=0x030d enabled=true reason=first-hidden-cursor attempt={} queued={queued}",
+            self.attempts
+        );
+        self.due = if queued || self.attempts >= 3 {
+            None
+        } else {
+            Some(now + RETRY_INTERVAL)
+        };
+    }
+}
+
 pub(crate) fn valid_cursor_channel_message(bytes: &[u8]) -> bool {
     if bytes.len() < 7 || !matches!(bytes[0], 0 | 1) {
         return false;
@@ -107,6 +143,13 @@ impl NvstCursorCapture {
                 eprintln!(
                     "NVST cursor capture tx: command=0x0308 enabled=false reason={reason} attempt={attempts} queued={sent}"
                 );
+                opennow_streamer_protocol::log::log_async(
+                    "INFO",
+                    "diagnostics",
+                    &format!(
+                        "cursor tx command=0x0308 enabled=false reason={reason} attempt={attempts} queued={sent}"
+                    ),
+                );
                 if sent {
                     self.state = CaptureState::Local;
                     return true;
@@ -114,6 +157,11 @@ impl NvstCursorCapture {
                 if *attempts == MAX_ATTEMPTS {
                     eprintln!(
                         "NVST cursor capture disable retries exhausted; retaining server-composited cursor until reactivation"
+                    );
+                    opennow_streamer_protocol::log::log_async(
+                        "WARN",
+                        "diagnostics",
+                        "cursor tx command=0x0308 disable retries exhausted; retaining server-composited cursor until reactivation",
                     );
                     self.state = CaptureState::Exhausted;
                 } else {
@@ -129,6 +177,29 @@ impl NvstCursorCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracking_refresh_is_once_per_stream_and_queue_retries_are_bounded() {
+        let now = Instant::now();
+        let mut refresh = CursorTrackingRefresh::default();
+        refresh.update(now, || panic!("no hidden cursor yet"));
+        refresh.hidden(now);
+        let mut sends = 0;
+        for tick in 0..20 {
+            let time = now + RETRY_INTERVAL * tick;
+            refresh.hidden(time);
+            refresh.update(time, || {
+                sends += 1;
+                false
+            });
+        }
+        assert_eq!(sends, 3);
+        let mut refresh = CursorTrackingRefresh::default();
+        refresh.hidden(now);
+        refresh.update(now, || true);
+        refresh.hidden(now + RETRY_INTERVAL);
+        refresh.update(now + RETRY_INTERVAL, || panic!("already queued"));
+    }
 
     #[test]
     fn cursor_channel_requires_complete_supported_framing() {
@@ -153,7 +224,7 @@ mod tests {
         let now = Instant::now();
         let mut capture = NvstCursorCapture::default();
         capture.activate(now);
-        for length in 0..8_u8 {
+        for length in 0..6_u8 {
             let mut bytes = vec![0x10, 0x01, length, 0];
             bytes.resize(4 + usize::from(length), 0);
             assert!(crate::nvst_input::server_cursor_messages(&bytes).is_empty());

@@ -109,3 +109,21 @@ ffmpeg -v error -i hevc-p010-pq-precision.hevc -frames:v 1 -pix_fmt yuv420p10le 
     -f rawvideo -y pq-decoded.yuv
 python -c "from pathlib import Path; Path('hevc-p010-pq-precision-luma.bin').write_bytes(Path('pq-decoded.yuv').read_bytes()[:877*2])"
 ```
+
+## 5K HDR resolution regression
+
+`hevc-p010-5k-pq.hevc` is a synthetic single-frame 5120x2880, ten-bit 4:2:0
+HEVC image with PQ/BT.2020 metadata. The explicit hardware regression checks
+negotiated dimensions, native P010 fallback from a Y410 request, D3D11 RGB10A2
+conversion and recovery without stale frames. It is not a startup capability
+probe or a performance benchmark. Generated locally with:
+
+```sh
+ffmpeg -hide_banner -loglevel error -f lavfi \
+  -i 'testsrc2=size=5120x2880:rate=1' -frames:v 1 \
+  -pix_fmt yuv420p10le -c:v libx265 -preset ultrafast \
+  -x265-params 'log-level=error:pools=4:frame-threads=1:info=0:keyint=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc' \
+  -f hevc -y hevc-p010-5k-pq.hevc
+```
+
+SHA256: `df7e79111e51d92e797143376f2990a4b69de1effd5932a709ee2625ecb31ddf`.

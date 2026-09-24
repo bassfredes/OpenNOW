@@ -819,6 +819,18 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                             message: error.message,
                         })
                 })
+                .inspect(|_| {
+                    // A successful prepare is where the seat's decision matters:
+                    // requested vs finalized bit depth and chroma are the record that
+                    // says whether a 4:4:4 request was granted or downgraded. Only the
+                    // failure path recorded it, so every working session left the
+                    // question unanswerable after the fact.
+                    core.diagnostics.record(
+                        "streamer",
+                        "prepare_profile_accepted",
+                        diagnostics::stream_profile_evidence(&params["session"]).to_string(),
+                    );
+                })
                 .inspect_err(|error| {
                     core.diagnostics.record(
                         "streamer",

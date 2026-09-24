@@ -3,6 +3,7 @@
 #include <QCryptographicHash>
 #include <QQuickGraphicsDevice>
 #include <QQuickWindow>
+#include <QSGRendererInterface>
 #include <QSet>
 #include <QVariantMap>
 
@@ -113,7 +114,15 @@ bool GraphicsDeviceSelection::applyTo(QQuickWindow *window) const
 {
     if (!m_active.luid) return true;
 #ifdef Q_OS_WIN
-    if (!window || window->isVisible() || window->isSceneGraphInitialized()) return false;
+    // Offscreen acceptance uses Qt's software scene graph, which can already
+    // be initialized while hidden and has no DXGI adapter to select.
+    if (window && window->rendererInterface()->graphicsApi() == QSGRendererInterface::Software)
+        return true;
+    if (!window || window->isVisible() || window->isSceneGraphInitialized()) {
+        qWarning("Graphics selection blocked: window=%d visible=%d sceneGraph=%d", bool(window),
+            window && window->isVisible(), window && window->isSceneGraphInitialized());
+        return false;
+    }
     window->setGraphicsDevice(QQuickGraphicsDevice::fromAdapter(
         quint32(m_active.luid), std::bit_cast<qint32>(quint32(m_active.luid >> 32))));
     qInfo("Selected graphics adapter: %s (LUID %016llx)", qUtf8Printable(m_active.name),

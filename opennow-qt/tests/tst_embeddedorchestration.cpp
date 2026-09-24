@@ -92,6 +92,81 @@ class EmbeddedOrchestrationTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void activeSessionLifecycleIsBoundedAndNonDisruptive()
+    {
+        QJSEngine engine;
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var root=this, ready=true, activeSession={sessionId:'seat',streamingBaseUrl:'https://example.invalid'};
+            var streamer={status:'streaming'}, sessionRecoveryPending=false, streamerStopExpected=false;
+            var streamStopRequestId='', streamLifecycleRequestId='', streamLifecycleSessionId='';
+            var requests=[], finished=[];
+            var CoreClient={request:function(method,params,timeout) {
+                requests.push({method:method,params:params,timeout:timeout}); return 'poll-'+requests.length;
+            }};
+            function acceptsSessionScope(scope) {return scope === undefined || scope.owner === 'current';}
+            function finishRemoteSession(termination) {finished.push(termination);}
+        )JS")).isError());
+        for (const auto &name : {"pollActiveSessionLifecycle", "acceptSessionLifecycleResponse",
+                 "isRemoteSessionTermination", "onResponseReceived", "onRequestFailed"})
+            QVERIFY(loadShellFunction(engine, QString::fromLatin1(name),
+                QString::fromLatin1(name).startsWith(u"on") ? 8 : 4));
+        auto result = engine.evaluate(QStringLiteral(R"JS(
+            pollActiveSessionLifecycle(); pollActiveSessionLifecycle();
+            if(requests.length !== 1 || requests[0].method !== 'session.poll'
+                || requests[0].params.sessionId !== 'seat' || !requests[0].params.recoveryMode
+                || requests[0].timeout !== 10000) throw Error('unbounded or wrong lifecycle request');
+            onResponseReceived('poll-1',{scope:{owner:'current'},session:{sessionId:'seat',status:2}});
+            if(finished.length || streamer.status !== 'streaming' || streamLifecycleRequestId !== '')
+                throw Error('healthy session was disturbed');
+            pollActiveSessionLifecycle();
+            onRequestFailed('poll-2','timeout','Network timeout');
+            if(finished.length || streamer.status !== 'streaming' || streamLifecycleRequestId !== '')
+                throw Error('transient network error ended media');
+            for(var state of ['recovering','stopping','notReady']) {
+                sessionRecoveryPending=state==='recovering'; streamerStopExpected=state==='stopping'; ready=state!=='notReady';
+                pollActiveSessionLifecycle();
+            }
+            if(requests.length !== 2) throw Error('queried during shutdown/recovery');
+        )JS"));
+        QVERIFY2(!result.isError(), qPrintable(result.toString()));
+    }
+
+    void activeSessionLifecycleRequiresMatchingAuthoritativeTermination()
+    {
+        QJSEngine engine;
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var activeSession={sessionId:'seat'}, streamLifecycleRequestId='',streamLifecycleSessionId='';
+            var finished=[];
+            function acceptsSessionScope(scope) {return !scope || scope.owner==='current';}
+            function finishRemoteSession(termination) {finished.push(termination);}
+        )JS")).isError());
+        for (const auto &name : {"acceptSessionLifecycleResponse", "isRemoteSessionTermination"})
+            QVERIFY(loadShellFunction(engine, QString::fromLatin1(name)));
+        const auto result = engine.evaluate(QStringLiteral(R"JS(
+            var cases=[
+                {result:null,expected:0},
+                {result:{scope:{owner:'current'},session:{sessionId:'seat',status:2}},expected:0},
+                {result:{scope:{owner:'current'},session:{sessionId:'other',status:7}},expected:0},
+                {result:{scope:{owner:'old'},session:{sessionId:'seat',status:7}},expected:0},
+                {result:{scope:{owner:'current'},termination:{source:'transport',sessionId:'seat',resumable:false}},expected:0},
+                {result:{scope:{owner:'current'},termination:{source:'cloudmatch-http',httpStatus:404,resumable:false}},expected:0},
+                {result:{session:{sessionId:'seat',status:7}},expected:0},
+                {result:{scope:{owner:'current'},session:{sessionId:'seat',status:7}},expected:1},
+                {result:{scope:{owner:'current'},termination:{source:'cloudmatch-http',httpStatus:404,sessionId:'seat',resumable:false}},expected:1}
+            ];
+            for(var test of cases) {
+                finished=[];streamLifecycleRequestId='poll';streamLifecycleSessionId='seat';
+                if(acceptSessionLifecycleResponse('old-poll',test.result)) throw Error('accepted wrong request');
+                if(!acceptSessionLifecycleResponse('poll',test.result) || finished.length !== test.expected)
+                    throw Error('wrong terminal classification '+JSON.stringify(test));
+            }
+            finished=[];streamLifecycleRequestId='poll';streamLifecycleSessionId='old-seat';
+            acceptSessionLifecycleResponse('poll',{scope:{owner:'current'},session:{sessionId:'old-seat',status:7}});
+            if(finished.length) throw Error('stale response ended replacement seat');
+        )JS"));
+        QVERIFY2(!result.isError(), qPrintable(result.toString()));
+    }
+
     void providerRpcFailureOffersBoundedAndManualRecovery()
     {
         QJSEngine engine;

@@ -1,4 +1,4 @@
-set(OPENNOW_CORE_TARGET_DIR "${CMAKE_BINARY_DIR}/rust-target")
+set(OPENNOW_CORE_TARGET_DIR "${CMAKE_BINARY_DIR}/rust-target" CACHE PATH "Core Cargo artifacts")
 set(OPENNOW_CORE_PROFILE "$<IF:$<CONFIG:Release>,release,debug>")
 set(OPENNOW_CORE_SUFFIX "$<IF:$<PLATFORM_ID:Windows>,.exe,>")
 if(APPLE)
@@ -45,7 +45,10 @@ add_dependencies(opennow-qt opennow-core)
 
 set(OPENNOW_GENERATED_NOTICES "${CMAKE_BINARY_DIR}/THIRD_PARTY_NOTICES.generated")
 add_custom_target(opennow-license-notices ALL
-    COMMAND "${CARGO_EXECUTABLE}" build
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "OPENNOW_UPDATE_ED25519_PUBLIC_KEY=${OPENNOW_UPDATE_ED25519_PUBLIC_KEY}"
+            "OPENNOW_BUILD_VERSION=${OPENNOW_BUILD_VERSION}"
+            "${CARGO_EXECUTABLE}" build
             --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-core/Cargo.toml"
             --target-dir "${OPENNOW_CORE_TARGET_DIR}"
             --bin opennow-license-report
@@ -77,6 +80,12 @@ endif()
 # into every Qt configuration.
 set(OPENNOW_STREAMER_PROFILE "release")
 set(OPENNOW_STREAMER_CARGO_FEATURE_ARGS)
+option(OPENNOW_WINDOWS_NVDEC_EXPERIMENT "Build the opt-in experimental Windows NVDEC bridge" OFF)
+if(WIN32 AND OPENNOW_WINDOWS_NVDEC_EXPERIMENT)
+    list(APPEND OPENNOW_STREAMER_CARGO_FEATURE_ARGS
+        --package opennow-streamer-platform-windows
+        --features opennow-streamer-platform-windows/nvdec-experiment)
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Distributable Linux builds carry FFmpeg's H.264/HEVC/AV1 software
     # fallback and native H.264 VAAPI with host-provided GPU drivers. Every Qt

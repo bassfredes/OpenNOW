@@ -69,6 +69,15 @@ private:
 static int runApplicationSession(int argc, char *argv[], QString &restartExecutable)
 {
     qputenv("QT_TLS_BACKEND", "schannel");
+    // Low-latency presentation by default: Qt's D3D swapchain otherwise queues
+    // two frames before Present blocks, which is one extra frame of latency at
+    // the stream cadence (Qt6Gui reads this variable; verified in Qt6Gui.dll).
+    // The launcher's -LowLatencyPresentation exports the same value, and
+    // OPENNOW_PIPELINE_LOW_LATENCY=0 turns the default off without a rebuild.
+    if (qEnvironmentVariableIsEmpty("QT_D3D_MAX_FRAME_LATENCY")
+        && qEnvironmentVariable("OPENNOW_PIPELINE_LOW_LATENCY") != u"0"_s) {
+        qputenv("QT_D3D_MAX_FRAME_LATENCY", "1");
+    }
     QElapsedTimer startupTimer;
     startupTimer.start();
     QGuiApplication::setApplicationName(u"OpenNOW"_s);

@@ -7,11 +7,13 @@ use thiserror::Error;
 
 mod frame_stage_timing;
 pub mod nvst;
+mod nvst_bitmap_cursor;
 mod nvst_budget;
 mod nvst_control;
 mod nvst_cursor;
 mod nvst_haptics;
 mod nvst_input;
+mod nvst_input_diagnostics;
 mod nvst_microphone;
 mod nvst_network;
 

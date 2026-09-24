@@ -23,6 +23,10 @@ pub(super) struct Y410Converter {
     input_view: ID3D11ShaderResourceView,
     vertex: ID3D11VertexShader,
     pixel: ID3D11PixelShader,
+    #[cfg(feature = "nvdec-gpu-interop")]
+    planes_pixel: ID3D11PixelShader,
+    #[cfg(feature = "nvdec-gpu-interop")]
+    plane_layout: ID3D11Buffer,
     quantization: ID3D11Buffer,
     rasterizer: ID3D11RasterizerState,
     slots: [Option<OutputSlot>; MAX_FRAME_SLOTS],
@@ -34,7 +38,17 @@ impl Y410Converter {
         immediate: &ID3D11DeviceContext,
         format: VideoFormat,
     ) -> Result<Self, String> {
-        let constants = Y410Constants::new(format)?;
+        if !matches!(
+            format.pixel_format,
+            crate::VideoPixelFormat::Y410 | crate::VideoPixelFormat::P010
+        ) {
+            return Err("GPU plane conversion requires a ten-bit YUV format".into());
+        }
+        // Both GPU planar layouts use the same ten-bit code-value conversion.
+        let constants = Y410Constants::new(VideoFormat {
+            pixel_format: crate::VideoPixelFormat::Y410,
+            ..format
+        })?;
         let mut input = None;
         let mut input_view = None;
         let mut deferred = None;
@@ -109,6 +123,57 @@ impl Y410Converter {
                 .map_err(|error| format!("create Y410 pixel shader: {error}"))?;
         }
         let mut quantization = None;
+        #[cfg(feature = "nvdec-gpu-interop")]
+        let (planes_pixel, plane_layout) = {
+            let code = compile(c"pixel_planes", c"ps_5_0")?;
+            let mut pixel = None;
+            let mut layout = None;
+            let values: [f32; 4] = [
+                if format.pixel_format == crate::VideoPixelFormat::P010 {
+                    1.0
+                } else {
+                    0.0
+                },
+                0.0,
+                if format.chroma_siting == crate::VideoChromaSiting::Left {
+                    0.5
+                } else {
+                    0.0
+                },
+                0.0,
+            ];
+            unsafe {
+                device
+                    .CreatePixelShader(
+                        std::slice::from_raw_parts(
+                            code.GetBufferPointer().cast(),
+                            code.GetBufferSize(),
+                        ),
+                        None,
+                        Some(&mut pixel),
+                    )
+                    .map_err(|error| format!("create GPU planes shader: {error}"))?;
+                device
+                    .CreateBuffer(
+                        &D3D11_BUFFER_DESC {
+                            ByteWidth: 16,
+                            Usage: D3D11_USAGE_IMMUTABLE,
+                            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                            ..Default::default()
+                        },
+                        Some(&D3D11_SUBRESOURCE_DATA {
+                            pSysMem: values.as_ptr().cast(),
+                            ..Default::default()
+                        }),
+                        Some(&mut layout),
+                    )
+                    .map_err(|error| format!("create GPU plane layout: {error}"))?;
+            }
+            (
+                pixel.ok_or("no GPU planes shader")?,
+                layout.ok_or("no GPU plane layout")?,
+            )
+        };
         let mut rasterizer = None;
         unsafe {
             device
@@ -146,6 +211,10 @@ impl Y410Converter {
             input_view: input_view.ok_or("no Y410 shader view")?,
             vertex: vertex.ok_or("no Y410 vertex shader")?,
             pixel: pixel.ok_or("no Y410 pixel shader")?,
+            #[cfg(feature = "nvdec-gpu-interop")]
+            planes_pixel,
+            #[cfg(feature = "nvdec-gpu-interop")]
+            plane_layout,
             quantization: quantization.ok_or("no Y410 quantization buffer")?,
             rasterizer: rasterizer.ok_or("no Y410 rasterizer")?,
             slots: std::array::from_fn(|_| None),
@@ -198,6 +267,24 @@ impl Y410Converter {
             });
         }
         let output = self.slots[slot].as_ref().ok_or("no Y410 output slot")?;
+        #[cfg(feature = "nvdec-gpu-interop")]
+        let plane_views = if let Some(planes) = &frame.gpu_planes {
+            let mut views = Vec::with_capacity(3);
+            for texture in &planes.textures {
+                let mut view = None;
+                if let Some(texture) = texture {
+                    unsafe {
+                        self.device
+                            .CreateShaderResourceView(texture, None, Some(&mut view))
+                    }
+                    .map_err(|error| format!("create GPU plane view: {error}"))?;
+                }
+                views.push(view);
+            }
+            Some(views)
+        } else {
+            None
+        };
         let region = D3D11_BOX {
             left: frame.aperture.x,
             top: frame.aperture.y,
@@ -207,16 +294,22 @@ impl Y410Converter {
             back: 1,
         };
         unsafe {
-            self.deferred.CopySubresourceRegion(
-                &self.input,
-                0,
-                0,
-                0,
-                0,
-                &frame.texture,
-                frame.subresource,
-                Some(&region),
-            );
+            #[cfg(feature = "nvdec-gpu-interop")]
+            let planar = plane_views.is_some();
+            #[cfg(not(feature = "nvdec-gpu-interop"))]
+            let planar = false;
+            if !planar {
+                self.deferred.CopySubresourceRegion(
+                    &self.input,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &frame.texture,
+                    frame.subresource,
+                    Some(&region),
+                );
+            }
             self.deferred
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             self.deferred.VSSetShader(&self.vertex, None);
@@ -225,6 +318,13 @@ impl Y410Converter {
                 .PSSetShaderResources(0, Some(&[Some(self.input_view.clone())]));
             self.deferred
                 .PSSetConstantBuffers(0, Some(&[Some(self.quantization.clone())]));
+            #[cfg(feature = "nvdec-gpu-interop")]
+            if let Some(views) = &plane_views {
+                self.deferred.PSSetShader(&self.planes_pixel, None);
+                self.deferred.PSSetShaderResources(1, Some(views));
+                self.deferred
+                    .PSSetConstantBuffers(1, Some(&[Some(self.plane_layout.clone())]));
+            }
             self.deferred.RSSetState(&self.rasterizer);
             self.deferred.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 Width: self.format.width as f32,

@@ -110,6 +110,13 @@ public:
     [[nodiscard]] static QPoint mapRemoteCursorPosition(const QPoint &normalizedPosition,
                                                         const QSize &videoSize,
                                                         const QSizeF &itemSize);
+    /// Input mode for one seat cursor notification. A manual pointer lock always
+    /// wins; with `absoluteOnHidden` set (default) a hidden system cursor (id 0)
+    /// never changes the mode — it neither enters relative mode nor leaves a
+    /// locked one — while a visible cursor still returns to absolute.
+    [[nodiscard]] static bool relativeInputForRemoteCursor(
+        bool hidden, bool currentRelative, std::optional<bool> manualRelative,
+        bool absoluteOnHidden);
     [[nodiscard]] static quint16 windowsVirtualKey(
         int key, Qt::KeyboardModifiers modifiers = Qt::NoModifier,
         quint32 nativeVirtualKey = 0);

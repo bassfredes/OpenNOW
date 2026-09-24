@@ -152,6 +152,8 @@ pub struct D3d11FrameSubmitter {
 impl D3d11FrameSubmitter {
     pub fn submit_video(&self, frame: EncodedVideoFrame) -> Result<PushOutcome, BackendError> {
         frame.validate()?;
+        // The frame's last RTP packet has arrived: start its stage clock here.
+        super::stage_timing::record_receive(frame.timestamp_100ns);
         let key_frame = frame.key_frame;
         let outcome = self
             .encoded
@@ -363,6 +365,39 @@ impl AdoptedResources {
             .ok()
             .filter(|slot| *slot < MAX_FRAME_SLOTS)
             .ok_or_else(|| format!("invalid D3D11 frame slot {frame_slot}"))?;
+        #[cfg(feature = "nvdec-gpu-interop")]
+        if frame.gpu_planes.is_some() {
+            self.reconfigure(frame.format);
+            if self.y410.is_none() {
+                self.y410 = Some(super::y410::Y410Converter::new(
+                    &self.device,
+                    &self.context,
+                    frame.format,
+                )?);
+            }
+            let texture = self
+                .y410
+                .as_mut()
+                .ok_or("no GPU plane converter")?
+                .record(slot, frame)?;
+            self.generation = self.generation.wrapping_add(1).max(1);
+            return Ok(D3d11RecordedFrame {
+                texture: texture.as_raw(),
+                texture_format: D3d11TextureFormat::Rgb10A2,
+                color_space: if frame.format.transfer_function == VideoTransferFunction::Pq {
+                    D3d11ColorSpace::Pq2020
+                } else {
+                    D3d11ColorSpace::Sdr709
+                },
+                width: frame.format.width,
+                height: frame.format.height,
+                frame_slot,
+                generation: self.generation,
+                presentation_time_ns: u64::try_from(frame.timestamp_100ns.max(0))
+                    .unwrap_or(0)
+                    .saturating_mul(100),
+            });
+        }
         let mut input_description = D3D11_TEXTURE2D_DESC::default();
         unsafe {
             frame.texture.GetDesc(&mut input_description);
@@ -456,7 +491,12 @@ impl AdoptedResources {
                     .map_err(|error| format!("CreateVideoProcessorInputView: {error}"))?;
             }
             let view = view.ok_or("D3D11 returned no video processor input view")?;
-            processor.input_views.insert(input_key, view.clone());
+            // MFT frames lease a finite, reusable surface pool. Bridge uploads
+            // own a fresh texture per frame: caching their views would retain
+            // every texture indefinitely and eventually exhaust GPU memory.
+            if frame._sample.is_some() {
+                processor.input_views.insert(input_key, view.clone());
+            }
             view
         };
         let source = RECT {
@@ -856,6 +896,8 @@ impl D3d11Frame {
         adopted: AdoptedD3d11Context,
         frame_slot: u32,
     ) -> Result<D3d11RecordedFrame, BackendError> {
+        // Last in-process stage before Present: Qt is about to compose this frame.
+        super::stage_timing::record_present(self.frame.timestamp_100ns);
         let mut state = self
             .state
             .lock()
@@ -1119,7 +1161,11 @@ fn run_decoder_worker(
     let mut produced_frames = 0_u64;
     let mut last_progress_log = Instant::now();
     let mut output = VecDeque::with_capacity(2);
+    #[cfg(feature = "nvdec-experiment")]
+    let select_native_chroma = std::env::var("OPENNOW_EXPERIMENTAL_NVDEC444").as_deref() == Ok("1")
+        && std::env::var("OPENNOW_NVDEC_NATIVE_420").as_deref() == Ok("1");
     while !stopping.load(Ordering::Acquire) {
+        super::stage_timing::maybe_report(Instant::now());
         let mut made_progress = false;
         output.clear();
         match decoder.poll_output(&mut output, &events) {
@@ -1187,6 +1233,21 @@ fn run_decoder_worker(
                 break;
             };
             if frame.reset_decoder && submitted_any {
+                #[cfg(feature = "nvdec-experiment")]
+                if decoder.reset_at_keyframe() {
+                    decoded
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                    decoder_generation.fetch_add(1, Ordering::AcqRel);
+                    submitted_any = false;
+                    pending_frame = Some(EncodedVideoFrame {
+                        reset_decoder: false,
+                        ..frame
+                    });
+                    made_progress = true;
+                    break;
+                }
                 decoder.stop();
                 decoded
                     .lock()
@@ -1233,7 +1294,32 @@ fn run_decoder_worker(
                     }
                 }
             }
-            if let Err(message) = decoder.submit(frame) {
+            #[cfg(feature = "nvdec-experiment")]
+            let selection = if select_native_chroma {
+                decoder.select_bitstream_decoder(&device, format, mode, &frame)
+            } else {
+                Ok(false)
+            };
+            #[cfg(not(feature = "nvdec-experiment"))]
+            let selection: Result<bool, String> = Ok(false);
+            if matches!(selection, Ok(true)) {
+                decoded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
+                if submitted_any {
+                    decoder_generation.fetch_add(1, Ordering::AcqRel);
+                }
+                submitted_any = false;
+                let _ = events.push(BackendEvent::VideoFormatChanged(decoder.format()));
+                // Async MFTs need their first NeedInput event. Poll before
+                // submitting and preserve the exact keyframe and descendants.
+                pending_frame = Some(frame);
+                made_progress = true;
+                break;
+            }
+            super::stage_timing::record_submit(frame.timestamp_100ns);
+            if let Err(message) = selection.and_then(|_| decoder.submit(frame)) {
                 decoder.stop();
                 decoded
                     .lock()
@@ -1799,6 +1885,28 @@ mod tests {
     #[test]
     #[ignore = "requires a hardware HEVC Main10 MFT and P010/PQ-to-RGB10A2/PQ conversion"]
     fn hevc_hdr_hardware_decode_and_conversion_preserve_pq_precision() {
+        verify_p010_hdr_precision(false);
+    }
+
+    #[cfg(feature = "nvdec-gpu-interop")]
+    #[test]
+    #[ignore = "requires NVIDIA GPU-plane mode and D3D11 conversion"]
+    fn gpu_planes_p010_fallback_preserves_pq_precision() {
+        verify_p010_hdr_precision(true);
+    }
+
+    fn verify_p010_hdr_precision(gpu: bool) {
+        verify_p010_hdr_precision_route(gpu, false);
+    }
+
+    #[cfg(feature = "nvdec-experiment")]
+    #[test]
+    #[ignore = "requires NVIDIA NVDEC and D3D11 HEVC Main10 hardware decoding"]
+    fn bitstream_selected_native_420_preserves_hdr_precision_and_444_return() {
+        verify_p010_hdr_precision_route(false, true);
+    }
+
+    fn verify_p010_hdr_precision_route(gpu: bool, select_native: bool) {
         let _runtime = EmbeddedMediaRuntime::initialize().expect("Media Foundation");
         let mut device = None;
         let mut context = None;
@@ -1819,6 +1927,16 @@ mod tests {
         let device = device.unwrap();
         let context = context.unwrap();
         let format = VideoFormat {
+            pixel_format: if gpu || select_native {
+                VideoPixelFormat::Y410
+            } else {
+                VideoPixelFormat::P010
+            },
+            chroma_format: if gpu || select_native {
+                VideoChromaFormat::Cs444
+            } else {
+                VideoChromaFormat::Cs420
+            },
             transfer_function: VideoTransferFunction::Pq,
             color_primaries: crate::VideoColorPrimaries::Bt2020,
             color_matrix: VideoColorMatrix::Bt2020,
@@ -1843,6 +1961,40 @@ mod tests {
             resources.reset_decoder_views();
             let mut decoder =
                 Decoder::new(&resources, format, WindowsDecoderMode::Hardware).unwrap();
+            #[cfg(feature = "nvdec-experiment")]
+            if select_native {
+                let packet = EncodedVideoFrame {
+                    codec: crate::VideoCodec::H265,
+                    data: include_bytes!("../../fixtures/probe/hevc-p010-pq-precision.hevc")
+                        .to_vec(),
+                    timestamp_100ns: 0,
+                    duration_100ns: format.frame_duration_100ns(),
+                    key_frame: true,
+                    reset_decoder: false,
+                };
+                assert!(
+                    decoder
+                        .select_bitstream_decoder(
+                            &resources,
+                            format,
+                            WindowsDecoderMode::Hardware,
+                            &packet
+                        )
+                        .unwrap()
+                );
+                assert!(matches!(decoder, super::super::nvdec::Decoder::Mf(_)));
+                assert!(
+                    !decoder
+                        .select_bitstream_decoder(
+                            &resources,
+                            format,
+                            WindowsDecoderMode::Hardware,
+                            &packet
+                        )
+                        .unwrap(),
+                    "same native chroma must not repeatedly reinitialize"
+                );
+            }
             let frame = decoder
                 .probe_frame(include_bytes!(
                     "../../fixtures/probe/hevc-p010-pq-precision.hevc"
@@ -1876,7 +2028,10 @@ mod tests {
                         .unwrap();
                     let bytes = std::slice::from_raw_parts(
                         mapped.pData.cast::<u8>(),
-                        877 * if description.Format == DXGI_FORMAT_P010 {
+                        877 * if description.Format == DXGI_FORMAT_P010
+                            || description.Format
+                                == ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT
+                        {
                             2
                         } else {
                             4
@@ -1888,7 +2043,14 @@ mod tests {
                 }
             };
             let (input_format, input) = read_row(&frame.texture, frame.subresource);
-            assert_eq!(input_format, DXGI_FORMAT_P010);
+            assert_eq!(
+                input_format,
+                if gpu {
+                    ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT
+                } else {
+                    DXGI_FORMAT_P010
+                }
+            );
             for (index, bytes) in input.chunks_exact(2).enumerate() {
                 let actual = u16::from_le_bytes([bytes[0], bytes[1]]);
                 assert_eq!(actual & 63, 0, "P010 sample alignment at {index}");
@@ -1931,6 +2093,37 @@ mod tests {
                 levels.len()
             );
             drop(frame);
+            #[cfg(feature = "nvdec-experiment")]
+            if select_native {
+                let sample = include_bytes!("../../fixtures/probe/hevc-y410-pq-precision.hevc");
+                let packet = EncodedVideoFrame {
+                    codec: crate::VideoCodec::H265,
+                    data: sample.to_vec(),
+                    timestamp_100ns: 10000000,
+                    duration_100ns: format.frame_duration_100ns(),
+                    key_frame: true,
+                    reset_decoder: false,
+                };
+                assert!(
+                    decoder
+                        .select_bitstream_decoder(
+                            &resources,
+                            format,
+                            WindowsDecoderMode::Hardware,
+                            &packet
+                        )
+                        .unwrap()
+                );
+                assert!(
+                    matches!(decoder, super::super::nvdec::Decoder::Nv(_)),
+                    "real 444 must retain the full-chroma decoder"
+                );
+                let full_chroma = decoder
+                    .probe_frame(sample)
+                    .expect("decode genuine 444 after native 420");
+                assert_eq!(full_chroma.format.chroma_format, VideoChromaFormat::Cs444);
+                assert_eq!(full_chroma.format.pixel_format, VideoPixelFormat::Y410);
+            }
             decoder.stop();
         }
     }
@@ -1938,6 +2131,70 @@ mod tests {
     #[test]
     #[ignore = "requires a hardware HEVC Main44410 MFT accepting P010 output and RGB10A2 conversion"]
     fn hevc_444_request_accepts_p010_output_without_decoder_restart() {
+        verify_p010_chroma_fallback(
+            1920,
+            1080,
+            false,
+            include_bytes!("../../fixtures/probe/hevc-p010-sdr.hevc"),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA HEVC 5K decoding and D3D11 conversion"]
+    fn hevc_5k_request_preserves_dimensions_without_decoder_restart() {
+        verify_p010_chroma_fallback(
+            5120,
+            2880,
+            true,
+            include_bytes!("../../fixtures/probe/hevc-p010-5k-pq.hevc"),
+        );
+    }
+
+    fn verify_p010_chroma_fallback(width: u32, height: u32, hdr: bool, sample: &[u8]) {
+        verify_p010_chroma_fallback_with_stream(width, height, hdr, sample, 0);
+    }
+
+    #[cfg(feature = "nvdec-gpu-interop")]
+    #[test]
+    #[ignore = "requires NVIDIA CUDA/D3D11 interop; concurrent sustained 5K conversion"]
+    fn gpu_planes_5k_concurrent_decode_and_render_remain_valid() {
+        assert_eq!(
+            std::env::var("OPENNOW_NVDEC_GPU_PLANES").as_deref(),
+            Ok("1")
+        );
+        verify_p010_chroma_fallback_with_stream(
+            5120,
+            2880,
+            true,
+            include_bytes!("../../fixtures/probe/hevc-p010-5k-pq.hevc"),
+            240,
+        );
+    }
+
+    #[cfg(feature = "nvdec-experiment")]
+    #[test]
+    #[ignore = "requires native-420 selection enabled and D3D11 HEVC hardware"]
+    fn bitstream_selected_native_420_5k_concurrent_decode_and_render() {
+        assert_eq!(
+            std::env::var("OPENNOW_NVDEC_NATIVE_420").as_deref(),
+            Ok("1")
+        );
+        verify_p010_chroma_fallback_with_stream(
+            5120,
+            2880,
+            true,
+            include_bytes!("../../fixtures/probe/hevc-p010-5k-pq.hevc"),
+            240,
+        );
+    }
+
+    fn verify_p010_chroma_fallback_with_stream(
+        width: u32,
+        height: u32,
+        hdr: bool,
+        sample: &[u8],
+        stream_frames: usize,
+    ) {
         let mut device = None;
         let mut context = None;
         unsafe {
@@ -1961,6 +2218,29 @@ mod tests {
             immediate_context: context.as_raw(),
         };
         let requested = VideoFormat {
+            width,
+            height,
+            frame_rate_numerator: std::num::NonZeroU32::new(if stream_frames > 0 {
+                120
+            } else {
+                60
+            })
+            .unwrap(),
+            transfer_function: if hdr {
+                VideoTransferFunction::Pq
+            } else {
+                VideoTransferFunction::Sdr
+            },
+            color_primaries: if hdr {
+                crate::VideoColorPrimaries::Bt2020
+            } else {
+                crate::VideoColorPrimaries::Bt709
+            },
+            color_matrix: if hdr {
+                VideoColorMatrix::Bt2020
+            } else {
+                VideoColorMatrix::Bt709
+            },
             pixel_format: VideoPixelFormat::Y410,
             chroma_format: VideoChromaFormat::Cs444,
             ..color_test_format()
@@ -1980,13 +2260,30 @@ mod tests {
         submitter
             .submit_video(EncodedVideoFrame {
                 codec: requested.codec,
-                data: include_bytes!("../../fixtures/probe/hevc-p010-sdr.hevc").to_vec(),
+                data: sample.to_vec(),
                 timestamp_100ns: 0,
                 duration_100ns: requested.frame_duration_100ns(),
                 key_frame: true,
                 reset_decoder: false,
             })
-            .expect("submit HEVC P010 SDR access unit");
+            .expect("submit HEVC P010 access unit");
+        // CUVID's parser keeps one access unit until the next arrives. A live
+        // stream provides that next packet; exercise the same path here.
+        #[cfg(feature = "nvdec-experiment")]
+        if std::env::var("OPENNOW_EXPERIMENTAL_NVDEC444").as_deref() == Ok("1")
+            && std::env::var("OPENNOW_NVDEC_LOW_LATENCY").as_deref() != Ok("1")
+        {
+            submitter
+                .submit_video(EncodedVideoFrame {
+                    codec: requested.codec,
+                    data: sample.to_vec(),
+                    timestamp_100ns: requested.frame_duration_100ns(),
+                    duration_100ns: requested.frame_duration_100ns(),
+                    key_frame: true,
+                    reset_decoder: false,
+                })
+                .expect("submit next access unit for CUVID parser");
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         let frame = loop {
             let frame = producer
@@ -2006,10 +2303,11 @@ mod tests {
                 .expect("P010 output must arrive without a replacement keyframe");
         };
         let actual = frame.format();
+        assert_eq!((actual.width, actual.height), (width, height));
         assert_eq!(actual.pixel_format, VideoPixelFormat::P010);
         assert_eq!(actual.chroma_format, VideoChromaFormat::Cs420);
         assert_eq!(actual.pixel_format.bit_depth(), 10);
-        assert_eq!(actual.transfer_function, VideoTransferFunction::Sdr);
+        assert_eq!(actual.transfer_function, requested.transfer_function);
         assert_eq!(actual.color_primaries, requested.color_primaries);
         assert_eq!(actual.color_matrix, requested.color_matrix);
         assert_eq!(
@@ -2020,13 +2318,150 @@ mod tests {
         let recorded = unsafe { frame.record(adopted, 0) }
             .expect("convert validated P010 output into the adopted RGB10A2 frame slot");
         assert_eq!(recorded.texture_format, D3d11TextureFormat::Rgb10A2);
-        assert_eq!(recorded.color_space, D3d11ColorSpace::Sdr709);
+        assert_eq!(
+            recorded.color_space,
+            if hdr {
+                D3d11ColorSpace::Pq2020
+            } else {
+                D3d11ColorSpace::Sdr709
+            }
+        );
         let output = unsafe { clone_interface::<ID3D11Texture2D>(recorded.texture) }.unwrap();
         let mut description = D3D11_TEXTURE2D_DESC::default();
         unsafe {
             output.GetDesc(&mut description);
         }
+        assert_eq!((description.Width, description.Height), (width, height));
         assert_eq!(description.Format, DXGI_FORMAT_R10G10B10A2_UNORM);
+        if stream_frames > 0 {
+            // Keep rendering while the independent decoder worker maps/copies
+            // later CUDA frames. No CPU readback serializes this workload.
+            let feed = submitter.clone();
+            let bytes = sample.to_vec();
+            let sender = std::thread::spawn(move || {
+                for n in 1..=stream_frames {
+                    feed.submit_video(EncodedVideoFrame {
+                        codec: requested.codec,
+                        data: bytes.clone(),
+                        timestamp_100ns: n as i64 * 83333,
+                        duration_100ns: 83333,
+                        key_frame: true,
+                        reset_decoder: false,
+                    })
+                    .expect("feed sustained GPU workload");
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let stream_started = Instant::now();
+            let mut current = frame;
+            let mut converted = 0;
+            while Instant::now() < deadline {
+                let mut fresh = false;
+                if let Some(next) = producer
+                    .acquire_latest()
+                    .expect("acquire sustained GPU frame")
+                {
+                    current = next;
+                    converted += 1;
+                    fresh = true;
+                }
+                while let Some(event) = producer.try_event() {
+                    assert!(
+                        matches!(event, BackendEvent::VideoFormatChanged(_)),
+                        "stream error: {event:?}; converted={converted} pts={} elapsed={:?}",
+                        current.frame.timestamp_100ns,
+                        stream_started.elapsed()
+                    );
+                }
+                // Qt reuses the composed RGB texture when no new frame arrives;
+                // do not run the native video processor twice at a 240 Hz poll.
+                if fresh {
+                    unsafe {
+                        let started = Instant::now();
+                        current
+                            .record(adopted, converted % MAX_FRAME_SLOTS as u32)
+                            .expect("concurrent GPU conversion");
+                        if converted < 5 {
+                            eprintln!("convert frame={converted} took={:?}", started.elapsed());
+                        }
+                        device
+                            .GetDeviceRemovedReason()
+                            .expect("GPU must remain valid under concurrent work");
+                    }
+                }
+                if current.frame.timestamp_100ns == stream_frames as i64 * 83333 {
+                    break;
+                }
+                // Match Qt's frame-ready wakeup rather than relying on a
+                // Windows timer poll to beat the 8.33 ms arrival cadence.
+                let _ = ready_receiver.recv_timeout(Duration::from_millis(10));
+            }
+            sender.join().unwrap();
+            assert_eq!(
+                current.frame.timestamp_100ns,
+                stream_frames as i64 * 83333,
+                "last frame must arrive"
+            );
+            assert!(
+                converted > 120,
+                "sustained workload did not make progress: {converted}"
+            );
+            assert_eq!(
+                producer.state.lock().unwrap().presented_decoder_generation,
+                1
+            );
+            eprintln!(
+                "Sustained 5K concurrent decode/render: {converted} frames, final PTS {}",
+                current.frame.timestamp_100ns
+            );
+        }
+        #[cfg(feature = "nvdec-experiment")]
+        if std::env::var("OPENNOW_EXPERIMENTAL_NVDEC444").as_deref() == Ok("1") {
+            for generation in 2..=4u64 {
+                let pts = generation as i64 * 10_000_000;
+                let packets = if std::env::var("OPENNOW_NVDEC_LOW_LATENCY").as_deref() == Ok("1") {
+                    1
+                } else {
+                    2
+                };
+                for n in 0..packets {
+                    submitter
+                        .submit_video(EncodedVideoFrame {
+                            codec: requested.codec,
+                            data: sample.to_vec(),
+                            timestamp_100ns: pts + n * requested.frame_duration_100ns(),
+                            duration_100ns: requested.frame_duration_100ns(),
+                            key_frame: true,
+                            reset_decoder: n == 0,
+                        })
+                        .expect("queue recovery keyframe and descendant");
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let recovered = loop {
+                    if let Some(frame) = producer.acquire_latest().expect("acquire recovery output")
+                    {
+                        break frame;
+                    }
+                    while let Some(event) = producer.try_event() {
+                        assert!(
+                            matches!(event, BackendEvent::VideoFormatChanged(_)),
+                            "unexpected recovery event: {event:?}"
+                        );
+                    }
+                    ready_receiver
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .expect("recovery must produce output");
+                };
+                assert_eq!(recovered.frame.timestamp_100ns, pts);
+                assert_eq!(recovered.format().pixel_format, VideoPixelFormat::P010);
+                assert_eq!(
+                    producer.state.lock().unwrap().presented_decoder_generation,
+                    generation
+                );
+                unsafe { recovered.record(adopted, 0) }.expect("convert recovered P010 frame");
+            }
+        }
     }
 
     #[test]
@@ -2039,6 +2474,109 @@ mod tests {
     #[ignore = "requires a hardware HEVC Main44410 MFT and Y410 PQ shader conversion"]
     fn hevc_hdr_444_hardware_decode_and_conversion_preserve_precision_and_chroma() {
         verify_hevc_444_hardware_precision(true);
+    }
+
+    #[test]
+    #[cfg(feature = "nvdec-experiment")]
+    #[ignore = "requires NVIDIA NVDEC, OPENNOW_EXPERIMENTAL_NVDEC444=1 and OPENNOW_NVDEC_LOW_LATENCY=1"]
+    fn nvdec_hdr_sdr_transitions_preserve_frames_and_reconfigure_conversion() {
+        assert_eq!(
+            std::env::var("OPENNOW_NVDEC_LOW_LATENCY").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(
+            std::env::var("OPENNOW_EXPERIMENTAL_NVDEC444").as_deref(),
+            Ok("1")
+        );
+        let _runtime = EmbeddedMediaRuntime::initialize().unwrap();
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .unwrap();
+        }
+        let device = device.unwrap();
+        let context = context.unwrap();
+        let format = VideoFormat {
+            pixel_format: VideoPixelFormat::Y410,
+            chroma_format: crate::VideoChromaFormat::Cs444,
+            transfer_function: VideoTransferFunction::Pq,
+            color_primaries: crate::VideoColorPrimaries::Bt2020,
+            color_matrix: VideoColorMatrix::Bt2020,
+            ..color_test_format()
+        };
+        let mut resources = unsafe {
+            AdoptedResources::new(
+                AdoptedD3d11Context {
+                    device: device.as_raw(),
+                    immediate_context: context.as_raw(),
+                },
+                format,
+            )
+        }
+        .unwrap();
+        let mut decoder = Decoder::new(&resources, format, WindowsDecoderMode::Hardware).unwrap();
+        let events = crate::queue::BoundedQueue::new(8);
+        let mut frames = VecDeque::new();
+        for (index, hdr) in [true, false, true, false].into_iter().enumerate() {
+            let sample = if hdr {
+                include_bytes!("../../fixtures/probe/hevc-p010-pq.hevc").as_slice()
+            } else {
+                include_bytes!("../../fixtures/probe/hevc-p010-sdr.hevc").as_slice()
+            };
+            decoder
+                .submit(EncodedVideoFrame {
+                    codec: format.codec,
+                    data: sample.to_vec(),
+                    timestamp_100ns: index as i64 * 166667,
+                    duration_100ns: 166667,
+                    key_frame: true,
+                    reset_decoder: false,
+                })
+                .unwrap();
+            assert_eq!(decoder.poll_output(&mut frames, &events).unwrap(), 1);
+            let frame = frames.pop_front().unwrap();
+            match events
+                .try_pop()
+                .expect("format change delivered to the media owner")
+            {
+                BackendEvent::VideoFormatChanged(updated) => assert_eq!(updated, frame.format),
+                event => panic!("unexpected recovery event: {event:?}"),
+            }
+            assert_eq!(frame.timestamp_100ns, index as i64 * 166667);
+            assert_eq!(frame.format.pixel_format, VideoPixelFormat::P010);
+            assert_eq!(
+                frame.format.transfer_function,
+                if hdr {
+                    VideoTransferFunction::Pq
+                } else {
+                    VideoTransferFunction::Sdr
+                }
+            );
+            let recorded = resources
+                .record(0, &frame)
+                .expect("convert without decoder recreation");
+            assert_eq!(
+                recorded.color_space,
+                if hdr {
+                    D3d11ColorSpace::Pq2020
+                } else {
+                    D3d11ColorSpace::Sdr709
+                }
+            );
+            assert_eq!(recorded.texture_format, D3d11TextureFormat::Rgb10A2);
+        }
+        decoder.stop();
     }
 
     fn verify_hevc_444_hardware_precision(hdr: bool) {
@@ -2115,7 +2653,13 @@ mod tests {
             unsafe {
                 frame.texture.GetDesc(&mut input_description);
             }
-            assert_eq!(input_description.Format, DXGI_FORMAT_Y410);
+            #[cfg(feature = "nvdec-gpu-interop")]
+            let planar = frame.gpu_planes.is_some();
+            #[cfg(not(feature = "nvdec-gpu-interop"))]
+            let planar = false;
+            if !planar {
+                assert_eq!(input_description.Format, DXGI_FORMAT_Y410);
+            }
             let read_rows = |texture: &ID3D11Texture2D, subresource: u32| {
                 let mut description = D3D11_TEXTURE2D_DESC::default();
                 unsafe {
@@ -2140,21 +2684,57 @@ mod tests {
                     context
                         .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                         .unwrap();
-                    let gray = std::slice::from_raw_parts(mapped.pData.cast::<u32>(), 877).to_vec();
-                    let chroma = std::slice::from_raw_parts(
-                        mapped
-                            .pData
-                            .cast::<u8>()
-                            .add(mapped.RowPitch as usize * 64)
-                            .cast::<u32>(),
-                        1920,
-                    )
-                    .to_vec();
+                    let row = |y: usize, count: usize| {
+                        let data = mapped.pData.cast::<u8>().add(mapped.RowPitch as usize * y);
+                        if description.Format
+                            == ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT
+                        {
+                            std::slice::from_raw_parts(data.cast::<u16>(), count)
+                                .iter()
+                                .map(|v| u32::from(*v >> 6))
+                                .collect()
+                        } else {
+                            std::slice::from_raw_parts(data.cast::<u32>(), count).to_vec()
+                        }
+                    };
+                    let gray = row(0, 877);
+                    let chroma = row(64, 1920);
                     context.Unmap(&staging, 0);
                     (gray, chroma)
                 }
             };
             let decoded_pixels = read_rows(&frame.texture, frame.subresource);
+            #[cfg(feature = "nvdec-gpu-interop")]
+            let decoded_pixels = if let Some(planes) = &frame.gpu_planes {
+                let rows: Vec<_> = planes
+                    .textures
+                    .iter()
+                    .map(|texture| {
+                        let texture = texture.as_ref().expect("each 4:4:4 plane must exist");
+                        let mut desc = D3D11_TEXTURE2D_DESC::default();
+                        unsafe { texture.GetDesc(&mut desc) };
+                        assert_eq!(
+                            desc.Format,
+                            ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT
+                        );
+                        assert_eq!(
+                            (desc.Width, desc.Height),
+                            (1920, 1080),
+                            "4:4:4 must not subsample any plane"
+                        );
+                        read_rows(texture, 0)
+                    })
+                    .collect();
+                let pack = |gray: bool| {
+                    let row = |p: usize| if gray { &rows[p].0 } else { &rows[p].1 };
+                    (0..row(0).len())
+                        .map(|i| 0xc0000000 | (row(2)[i] << 20) | (row(0)[i] << 10) | row(1)[i])
+                        .collect::<Vec<u32>>()
+                };
+                (pack(true), pack(false))
+            } else {
+                decoded_pixels
+            };
             let recorded = resources
                 .record(0, &frame)
                 .expect("convert actual Y410 decoder surface");
@@ -2422,6 +3002,30 @@ mod tests {
             baseline_refs,
             "frame release must return its lease without leaking samples"
         );
+        let retained_pool_views = resources.processor.as_ref().unwrap().input_views.len();
+        for timestamp in 0..128 {
+            let mut uploaded = None;
+            unsafe { device.CreateTexture2D(&description, None, Some(&mut uploaded)) }.unwrap();
+            let transient = DecodedVideoFrame {
+                format,
+                aperture: crate::aperture::VideoAperture::new(64, 64, None).unwrap(),
+                texture: uploaded.unwrap(),
+                subresource: 0,
+                timestamp_100ns: timestamp,
+                duration_100ns: format.frame_duration_100ns(),
+                _sample: None,
+                #[cfg(feature = "nvdec-gpu-interop")]
+                gpu_planes: None,
+            };
+            resources
+                .record(0, &transient)
+                .expect("convert transient uploaded texture");
+            assert_eq!(
+                resources.processor.as_ref().unwrap().input_views.len(),
+                retained_pool_views,
+                "transient uploads must not accumulate retained input textures"
+            );
+        }
         for changed in [
             VideoFormat {
                 chroma_siting: VideoChromaSiting::TopLeft,

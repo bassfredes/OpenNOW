@@ -327,8 +327,9 @@ impl CloudMatchService {
                     json!(hdr_mode);
                 resume["sessionRequestData"]["clientRequestMonitorSettings"][0]["displayData"] =
                     monitor_display_data(hdr_mode == 1, settings);
+                // Native HDR mode does not enable the separate TrueHDR feature.
                 resume["sessionRequestData"]["requestedStreamingFeatures"]["trueHdr"] =
-                    json!(hdr_mode == 1);
+                    json!(false);
             }
             // Fresh native sessions remain pollable even if this compatibility
             // mutation is not accepted by an older CloudMatch pool.
@@ -1384,10 +1385,15 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
     // requestedStreamingFeatures, field-for-field with the official Bifrost request
     // builder: reflex, bitDepth, cloudGsync, enabledL4S, mouseMovementFlags, trueHdr,
     // supportedHidDevices, profile, fallbackToLogicalResolution, hidDevices,
-    // chromaFormat, prefilterMode/Sharpness/NoiseReduction, hudStreamingMode.
-    // Codec, bitrate ceiling, vsync, channel count, QoS policy, touch support, and the
-    // dynamic quality policy are deliberately absent: the official client resolves the
-    // codec locally and carries bitrate/policy purely in the RTSP ANNOUNCE.
+    // chromaFormat, prefilterMode/Sharpness/NoiseReduction, hudStreamingMode,
+    // qosPolicy, touchSupport, dlssOverrides. Codec, bitrate ceiling, vsync, channel
+    // count, and the dynamic quality policy are deliberately absent: the official
+    // client resolves the codec locally and carries bitrate/policy purely in the
+    // RTSP ANNOUNCE.
+    // prefilterMode mirrors the official 4:4:4 session request (geronimo
+    // 20260924: client requested Mode 1 and the seat finalized Mode 1,
+    // lines 11168/11279); 4:2:0 keeps 0, which is what every OpenNOW session
+    // has sent so far.
     let mut features = json!({
         "reflex":reflex,
         "bitDepth":bit_depth,
@@ -1397,14 +1403,22 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
         "profile":0,
         "fallbackToLogicalResolution":false,
         "chromaFormat":chroma,
-        "prefilterMode":0,
+        "prefilterMode":if chroma == 1 { 1 } else { 0 },
         "prefilterSharpness":0,
         "prefilterNoiseReduction":0,
         "hudStreamingMode":0
     });
     features["mouseMovementFlags"] = json!(0);
-    features["trueHdr"] = json!(hdr);
+    // The official Windows client requests native HDR with sdrHdrMode=1 while
+    // leaving TrueHDR disabled (including video.trueHdrParams.enableTrueHdr=0).
+    // OpenNOW negotiates native HDR, not that separate conversion feature.
+    features["trueHdr"] = json!(false);
     features["hidDevices"] = Value::Null;
+    // Sent by the official request (geronimo 20260924 line 11168); inert
+    // until the server echoes them, present so the body stays field-for-field.
+    features["qosPolicy"] = json!(0);
+    features["touchSupport"] = json!(false);
+    features["dlssOverrides"] = Value::Null;
     json!({"sessionRequestData":{
         "appId":app_id.parse::<i64>().unwrap_or_default(),
         "internalTitle":params["title"].as_str(),
@@ -3892,7 +3906,7 @@ mod tests {
             let request = &body["sessionRequestData"];
             assert_eq!(request["sdrHdrMode"], 1);
             assert_eq!(request["clientRequestMonitorSettings"][0]["sdrHdrMode"], 1);
-            assert_eq!(request["requestedStreamingFeatures"]["trueHdr"], true);
+            assert_eq!(request["requestedStreamingFeatures"]["trueHdr"], false);
             assert_eq!(request["requestedStreamingFeatures"]["bitDepth"], 1);
             assert_eq!(request["requestedStreamingFeatures"]["chromaFormat"], 1);
         }
@@ -3928,7 +3942,7 @@ mod tests {
         let request = &body["sessionRequestData"];
         assert_eq!(request["sdrHdrMode"], 1);
         assert_eq!(request["clientRequestMonitorSettings"][0]["sdrHdrMode"], 1);
-        assert_eq!(request["requestedStreamingFeatures"]["trueHdr"], true);
+        assert_eq!(request["requestedStreamingFeatures"]["trueHdr"], false);
         assert_eq!(request["requestedStreamingFeatures"]["bitDepth"], 1);
         assert_eq!(request["requestedStreamingFeatures"]["chromaFormat"], 0);
         let display_data = &request["clientRequestMonitorSettings"][0]["displayData"];
@@ -4394,8 +4408,13 @@ mod tests {
         assert!(features.get("dynamicStreamingMode").is_none());
         assert!(features.get("audioChannelCount").is_none());
         assert!(features.get("vsync").is_none());
-        assert!(features.get("qosPolicy").is_none());
-        assert!(features.get("touchSupport").is_none());
+        // Official request fields (geronimo 20260924 line 11168): qosPolicy 0,
+        // touchSupport false, dlssOverrides null, prefilterMode 1 for a 4:4:4
+        // session.
+        assert_eq!(features["qosPolicy"], 0);
+        assert_eq!(features["touchSupport"], false);
+        assert!(features["dlssOverrides"].is_null());
+        assert_eq!(features["prefilterMode"], 1);
     }
 
     #[test]
