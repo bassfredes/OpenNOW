@@ -216,6 +216,11 @@ Crowdin and should change only through Crowdin synchronization pull requests.
 - Use `tgrep` (trigram-indexed grep) instead of `grep` for code and log searches:
   `tgrep [-i] [-F] PATTERN [PATH]...`. Fall back to `grep` only for pipes/stdin or if `tgrep`
   fails.
+- Patterns are regular expressions by default (`"foo|bar"` works). Do not pass `-E`: in `tgrep`
+  it means `--encoding` and the search fails with "unsupported encoding".
+- Run `tgrep` from the repository root and narrow with `-g` globs (for example
+  `tgrep -n "pattern" -g 'native/**'`). Passing a subdirectory as `PATH` bypasses the index and
+  scans every file, including build output.
 - Build or refresh the index from the repo root with
   `tgrep index . --exclude target --exclude node_modules --exclude .git`. Keep `.tgrep/` out of
   version control.

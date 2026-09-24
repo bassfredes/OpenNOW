@@ -30,13 +30,7 @@ struct FrameInfo {
     output_layout: i32,
 }
 unsafe extern "C" {
-    fn on_hevc_keyframe_layout(
-        data: *const u8,
-        size: i32,
-        width: i32,
-        height: i32,
-        depth: i32,
-    ) -> i32;
+    fn on_hevc_keyframe_layout(data: *const u8, size: i32, width: i32, height: i32) -> i32;
     fn on_nvdec_pixel_format_name(format: i32) -> *const std::ffi::c_char;
     fn on_nvdec_open(width: i32, height: i32, depth: i32) -> *mut c_void;
     fn on_nvdec_close(decoder: *mut c_void);
@@ -171,8 +165,11 @@ impl Decoder {
             Self::Nv(d) => d.submit(frame),
         }
     }
-    // The request remains 4:4:4. Choose the decoder only from actual bitstream
-    // metadata, before submitting this unmodified random-access unit.
+    // The request may name a color quality the seat did not encode. Choose
+    // the decoder only from the parsed bitstream, before submitting this
+    // unmodified random-access unit: a valid SPS whose depth or chroma
+    // differs from the request always routes to the decoder that matches the
+    // actual stream instead of failing on it.
     pub(super) fn select_bitstream_decoder<G: DecoderDevice>(
         &mut self,
         device: &G,
@@ -183,24 +180,21 @@ impl Decoder {
         let Some(actual) = keyframe_format(requested, frame) else {
             return Ok(false);
         };
-        let native_420 = actual.chroma_format == VideoChromaFormat::Cs420;
-        if native_420 == matches!(self, Self::Mf(_)) {
+        let Some(target) = plan_bitstream_decoder(self.format(), actual) else {
             return Ok(false);
-        }
-        let replacement = if native_420 {
-            Self::Mf(MfDecoder::new(device, actual, mode)?)
-        } else {
-            Self::Nv(NvDecoder::new(device, actual)?)
+        };
+        let replacement = match target {
+            BitstreamDecoder::MediaFoundation => Self::Mf(MfDecoder::new(device, actual, mode)?),
+            BitstreamDecoder::Nvdec => Self::Nv(NvDecoder::new(device, actual)?),
         };
         video_log!(
             "HEVC bitstream decoder selection: requested={:?} actual={:?} depth={} route={}; request and compressed pixels unchanged",
-            requested.chroma_format,
-            actual.chroma_format,
+            requested.pixel_format,
+            actual.pixel_format,
             actual.pixel_format.bit_depth(),
-            if native_420 {
-                "Media Foundation D3D11"
-            } else {
-                "NVDEC full-chroma"
+            match target {
+                BitstreamDecoder::MediaFoundation => "Media Foundation D3D11",
+                BitstreamDecoder::Nvdec => "NVDEC full-chroma",
             }
         );
         self.stop();
@@ -250,10 +244,33 @@ impl Decoder {
     }
 }
 
+/// Which decoder presents a parsed bitstream layout: Media Foundation's
+/// D3D11 MFT negotiates NV12/P010 output for 4:2:0, NVDEC decodes the
+/// full-chroma 4:4:4 surfaces the MFT cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BitstreamDecoder {
+    MediaFoundation,
+    Nvdec,
+}
+
+/// Rebuild the running decoder when its surfaces cannot present `actual`;
+/// `None` keeps it. Pixel format and chroma are the decoder's whole shape —
+/// they carry both the bit depth and the surface layout — so equality on
+/// both means the running decoder already matches what the seat encoded.
+fn plan_bitstream_decoder(running: VideoFormat, actual: VideoFormat) -> Option<BitstreamDecoder> {
+    if running.pixel_format == actual.pixel_format && running.chroma_format == actual.chroma_format
+    {
+        return None;
+    }
+    Some(match actual.chroma_format {
+        VideoChromaFormat::Cs420 => BitstreamDecoder::MediaFoundation,
+        VideoChromaFormat::Cs444 => BitstreamDecoder::Nvdec,
+    })
+}
+
 fn keyframe_format(requested: VideoFormat, frame: &EncodedVideoFrame) -> Option<VideoFormat> {
     if requested.codec != VideoCodec::H265
         || frame.codec != VideoCodec::H265
-        || requested.chroma_format != VideoChromaFormat::Cs444
         || !frame.key_frame
         || frame.data.is_empty()
         || frame.data.len() > 32 * 1024 * 1024
@@ -266,7 +283,6 @@ fn keyframe_format(requested: VideoFormat, frame: &EncodedVideoFrame) -> Option<
             frame.data.len() as i32,
             requested.width as i32,
             requested.height as i32,
-            requested.pixel_format.bit_depth() as i32,
         )
     };
     let (pixel_format, chroma_format) = match layout {
@@ -279,6 +295,14 @@ fn keyframe_format(requested: VideoFormat, frame: &EncodedVideoFrame) -> Option<
     Some(VideoFormat {
         pixel_format,
         chroma_format,
+        // An 8-bit bitstream cannot carry HDR10 and validate() rejects an
+        // HDR label on 8-bit decoder output; the actual depth defines the
+        // transfer label so the routed decoder always constructs.
+        transfer_function: if pixel_format.bit_depth() == 8 {
+            VideoTransferFunction::Sdr
+        } else {
+            requested.transfer_function
+        },
         ..requested
     })
 }
@@ -615,59 +639,118 @@ fn decoded_color(mut format: VideoFormat, info: &FrameInfo) -> Result<VideoForma
 mod tests {
     use super::*;
     #[test]
-    fn hevc_keyframe_metadata_distinguishes_native_chroma_and_rejects_mismatch() {
-        let samples: &[(&[u8], i32, i32, i32, i32)] = &[
+    fn hevc_keyframe_layout_follows_the_bitstream_and_rejects_other_resolutions() {
+        let samples: &[(&[u8], i32, i32, i32)] = &[
             (
                 include_bytes!("../../fixtures/probe/hevc-p010-pq.hevc"),
                 1920,
                 1080,
-                10,
                 3,
             ),
             (
                 include_bytes!("../../fixtures/probe/hevc-p010-5k-pq.hevc"),
                 5120,
                 2880,
-                10,
                 3,
             ),
             (
                 include_bytes!("../../fixtures/probe/hevc-y410-pq-precision.hevc"),
                 1920,
                 1080,
-                10,
                 1,
             ),
             (
                 include_bytes!("../../fixtures/probe/hevc-ayuv-sdr.hevc"),
                 1920,
                 1080,
-                8,
                 0,
             ),
         ];
-        for &(data, width, height, depth, layout) in samples {
-            let inspect = |bytes: &[u8], w, d| unsafe {
-                on_hevc_keyframe_layout(bytes.as_ptr(), bytes.len() as i32, w, height, d)
+        for &(data, width, height, layout) in samples {
+            let inspect = |bytes: &[u8], w| unsafe {
+                on_hevc_keyframe_layout(bytes.as_ptr(), bytes.len() as i32, w, height)
             };
-            assert_eq!(inspect(data, width, depth), layout);
+            // The parser's own pixel format decides depth and chroma, exactly
+            // as the bitstream encodes them.
+            assert_eq!(inspect(data, width), layout);
             assert_eq!(
-                inspect(data, width + 2, depth),
+                inspect(data, width + 2),
                 -1,
                 "do not reroute a different resolution"
             );
             assert_eq!(
-                inspect(data, width, if depth == 10 { 8 } else { 10 }),
-                -1,
-                "do not downgrade or fabricate bit depth"
-            );
-            assert_eq!(
-                inspect(&data[..8], width, depth),
+                inspect(&data[..8], width),
                 -1,
                 "incomplete headers prove no layout"
             );
-            assert_eq!(inspect(&[], width, depth), -1);
+            assert_eq!(inspect(&[], width), -1);
         }
+    }
+
+    fn requested_hdr_444_format() -> VideoFormat {
+        VideoFormat {
+            codec: VideoCodec::H265,
+            width: 1920,
+            height: 1080,
+            frame_rate_numerator: std::num::NonZeroU32::new(60).unwrap(),
+            frame_rate_denominator: std::num::NonZeroU32::new(1).unwrap(),
+            average_bitrate: 20_000_000,
+            pixel_format: VideoPixelFormat::Y410,
+            chroma_format: VideoChromaFormat::Cs444,
+            chroma_siting: crate::VideoChromaSiting::Left,
+            full_range: false,
+            transfer_function: VideoTransferFunction::Pq,
+            color_primaries: VideoColorPrimaries::Bt2020,
+            color_matrix: VideoColorMatrix::Bt2020,
+        }
+    }
+
+    #[test]
+    fn eight_bit_420_sdr_routes_away_from_requested_10bit_444_hdr() {
+        let requested = requested_hdr_444_format();
+        requested
+            .validate()
+            .expect("the 10-bit 4:4:4 HDR request is itself valid");
+        // The seat encoded 8-bit 4:2:0 SDR although 10-bit 4:4:4 HDR was
+        // requested — the 2026-09-24 live session that presented no frame.
+        let actual = VideoFormat {
+            pixel_format: VideoPixelFormat::Nv12,
+            chroma_format: VideoChromaFormat::Cs420,
+            transfer_function: VideoTransferFunction::Sdr,
+            ..requested
+        };
+        assert_eq!(
+            plan_bitstream_decoder(requested, actual),
+            Some(BitstreamDecoder::MediaFoundation),
+            "8-bit 4:2:0 must move to the Media Foundation NV12 decoder"
+        );
+        actual
+            .validate()
+            .expect("the routed 8-bit SDR format must construct");
+        // Once the running decoder matches the stream, it is never reinitialized.
+        assert_eq!(plan_bitstream_decoder(actual, actual), None);
+    }
+
+    #[test]
+    fn eight_bit_keyframe_parses_and_labels_sdr_despite_a_ten_bit_hdr_request() {
+        let requested = requested_hdr_444_format();
+        let frame = EncodedVideoFrame {
+            codec: VideoCodec::H265,
+            data: include_bytes!("../../fixtures/probe/hevc-ayuv-sdr.hevc").to_vec(),
+            timestamp_100ns: 0,
+            duration_100ns: requested.frame_duration_100ns(),
+            key_frame: true,
+            reset_decoder: false,
+        };
+        let actual = keyframe_format(requested, &frame)
+            .expect("an 8-bit keyframe must parse despite the 10-bit request");
+        assert_eq!(actual.pixel_format, VideoPixelFormat::Ayuv);
+        assert_eq!(actual.transfer_function, VideoTransferFunction::Sdr);
+        assert_eq!(
+            plan_bitstream_decoder(requested, actual),
+            Some(BitstreamDecoder::Nvdec),
+            "real 4:4:4 keeps the full-chroma decoder"
+        );
     }
     #[cfg(feature = "nvdec-gpu-interop")]
     #[test]

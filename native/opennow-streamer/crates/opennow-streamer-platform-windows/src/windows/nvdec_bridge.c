@@ -41,8 +41,12 @@ const char *on_nvdec_pixel_format_name(int format) { return av_get_pix_fmt_name(
 
 /* Inspect a complete random-access unit without decoding or altering it.
  * Only an active SPS/PPS referenced by a parsed picture proves the layout.
+ * The parser's pixel format IS the bitstream's own depth and chroma; no
+ * requested depth may mask them, because the decoder must match what the
+ * seat actually encoded (2026-09-24: a 10-bit request left an 8-bit 4:2:0
+ * stream on a decoder that could never present it).
  * Return the bridge layout, or -1 when metadata is absent/incompatible. */
-int on_hevc_keyframe_layout(const uint8_t *data, int size, int width, int height, int depth) {
+int on_hevc_keyframe_layout(const uint8_t *data, int size, int width, int height) {
     if (!data || size <= 0 || size > 32*1024*1024) return -1;
     AVCodecParserContext *parser = av_parser_init(AV_CODEC_ID_HEVC);
     AVCodecContext *ctx = avcodec_alloc_context3(NULL);
@@ -58,10 +62,10 @@ int on_hevc_keyframe_layout(const uint8_t *data, int size, int width, int height
         packet->data, size, 0, 0, 0);
     if (parsed < 0 || output_size != size || parser->key_frame != 1 ||
         parser->width != width || parser->height != height) goto done;
-    if (depth == 10 && parser->format == AV_PIX_FMT_YUV420P10LE) layout = 3;
-    if (depth == 10 && parser->format == AV_PIX_FMT_YUV444P10LE) layout = 1;
-    if (depth == 8 && parser->format == AV_PIX_FMT_YUV420P) layout = 2;
-    if (depth == 8 && parser->format == AV_PIX_FMT_YUV444P) layout = 0;
+    if (parser->format == AV_PIX_FMT_YUV420P10LE) layout = 3;
+    if (parser->format == AV_PIX_FMT_YUV444P10LE) layout = 1;
+    if (parser->format == AV_PIX_FMT_YUV420P) layout = 2;
+    if (parser->format == AV_PIX_FMT_YUV444P) layout = 0;
 done:
     av_packet_free(&packet);
     avcodec_free_context(&ctx);

@@ -929,7 +929,18 @@ pub fn prepare_owned_nvst(
         ),
     );
 
-    let offer = offer_color_overrides(&describe.body);
+    // Diagnostic only: record the keys the seat proposed. OpenNOW announces
+    // its own settings-derived values, as the official client does — applying
+    // the offer replaced our color keys with the seat's DESCRIBE defaults
+    // (8-bit 4:2:0 SDR) and the decoder never presented a frame (2026-09-24).
+    opennow_streamer_protocol::log::log_line(
+        "INFO",
+        "nvst-offer-color",
+        &format!(
+            "describe offered {}",
+            describe_color_offer(&describe.body).join(" ")
+        ),
+    );
     let announce_body = build_announce(
         context,
         AnnounceParams {
@@ -947,7 +958,6 @@ pub fn prepare_owned_nvst(
             video_packet_size,
             rtcp_on_sctp,
             microphone_available,
-            offer: &offer,
         },
     );
     // Sanitized copy of the full ANNOUNCE in the diagnostics log (directive):
@@ -1006,12 +1016,6 @@ struct AnnounceParams<'a> {
     video_packet_size: usize,
     rtcp_on_sctp: bool,
     microphone_available: bool,
-    /// Color/encoder keys the seat offered in its DESCRIBE; when present the
-    /// offer value replaces ours for exactly those keys (official reads its
-    /// config from the SDP, geronimo 20260924 L11697, and the Mac reference
-    /// documents "the seat's value wins for keys we would otherwise
-    /// hardcode").
-    offer: &'a [(String, String)],
 }
 
 /// Redacts the secret-bearing ANNOUNCE lines for diagnostics: ICE ufrag/pwd,
@@ -1045,11 +1049,11 @@ fn sanitize_announce_for_log(body: &str) -> String {
         .join("\r\n")
 }
 
-/// Color/encoder keys whose value comes from the seat's DESCRIBE offer when
-/// the seat provides it. Always logs the offered values (payload-free config
-/// keys only) so the next live session shows exactly what the seat proposed —
-/// the previous unknown that kept the 4:4:4 gate unobservable.
-fn offer_color_overrides(describe: &str) -> Vec<(String, String)> {
+/// Color/encoder keys the seat proposed in its DESCRIBE, formatted for the
+/// payload-free `nvst-offer-color` diagnostic line (config keys only, never
+/// payload). The offered values are observed, never applied: OpenNOW
+/// announces its own settings-derived values, as the official client does.
+fn describe_color_offer(describe: &str) -> Vec<String> {
     const KEYS: [&str; 15] = [
         "video[0].bitDepth",
         "video[0].chromaFormat",
@@ -1067,23 +1071,16 @@ fn offer_color_overrides(describe: &str) -> Vec<(String, String)> {
         "video[0].maxH264Level",
         "vqos[0].H265BitStreamProfile",
     ];
-    let mut overrides = Vec::new();
     let mut present = Vec::new();
     for key in KEYS {
         if let Some(value) = sdp_attribute(describe, key) {
             present.push(format!("{key}={value}"));
-            overrides.push((format!("x-nv-{key}"), value));
         }
     }
     if present.is_empty() {
         present.push("none".to_owned());
     }
-    opennow_streamer_protocol::log::log_line(
-        "INFO",
-        "nvst-offer-color",
-        &format!("describe offered {}", present.join(" ")),
-    );
-    overrides
+    present
 }
 
 fn negotiate_microphone(context: &SessionContext, describe: &str) -> bool {
@@ -1279,17 +1276,6 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         lines.push("a=x-nv-mic.micSsrcConfig.senderSsrc:1".to_owned());
     }
     lines.extend(announce_color_lines(params.stream));
-    // The seat's DESCRIBE offer wins for the color/encoder keys it provides,
-    // replacing ours in place and never adding keys we do not emit: official
-    // reads its config from the SDP (geronimo 20260924 L11697 "read 4114
-    // NvscClientConfig attributes from SDP") and the Mac reference applies
-    // the same authority rule.
-    for (key, value) in params.offer {
-        let prefix = format!("a={key}:");
-        if let Some(slot) = lines.iter().position(|line| line.starts_with(&prefix)) {
-            lines[slot] = format!("{prefix}{value}");
-        }
-    }
     lines.extend([
         "t=0 0".to_owned(),
         format!("m=video {}", params.video_port),
@@ -1940,7 +1926,6 @@ mod tests {
                 video_packet_size: 1280,
                 rtcp_on_sctp: true,
                 microphone_available: false,
-                offer: &[],
             },
         );
         assert!(sdp.contains("a=x-nv-video[0].maxFPS:360"));
@@ -1963,7 +1948,6 @@ mod tests {
                 video_packet_size: 1280,
                 rtcp_on_sctp: true,
                 microphone_available: false,
-                offer: &[],
             },
         );
         assert!(sdp.contains("a=x-nv-video[0].maxFPS:360"));
@@ -1988,7 +1972,6 @@ mod tests {
                 video_packet_size: 1280,
                 rtcp_on_sctp: true,
                 microphone_available: false,
-                offer: &[],
             },
         );
         assert!(sdp.contains("a=x-nv-video[0].maxFPS:120"));
@@ -2022,7 +2005,6 @@ mod tests {
                     video_packet_size,
                     rtcp_on_sctp: true,
                     microphone_available: false,
-                    offer: &[],
                 },
             );
             assert_eq!(
@@ -2059,7 +2041,6 @@ mod tests {
                 video_packet_size: packet_size,
                 rtcp_on_sctp: true,
                 microphone_available: false,
-                offer: &[],
             },
         );
         assert_eq!(
@@ -2123,7 +2104,6 @@ mod tests {
                     video_packet_size: 1280,
                     rtcp_on_sctp: true,
                     microphone_available: false,
-                    offer: &[],
                 },
             );
             assert!(sdp.contains(&format!("a=x-nv-vqos[0].dynamicStreamingMode:{policy}\r\n")));
@@ -2159,7 +2139,6 @@ mod tests {
                     video_packet_size: 1280,
                     rtcp_on_sctp: true,
                     microphone_available: false,
-                    offer: &[],
                 },
             );
             // HDR carries an explicit :1; SDR omits the line, like the official client.
@@ -2189,7 +2168,6 @@ mod tests {
                 video_packet_size: 1280,
                 rtcp_on_sctp: true,
                 microphone_available: false,
-                offer: &[],
             },
         );
         assert!(sdp.contains("a=x-nv-video[0].initialBitrateKbps:200000"));
@@ -2228,7 +2206,6 @@ mod tests {
                         video_packet_size: 1280,
                         rtcp_on_sctp: true,
                         microphone_available: available,
-                        offer: &[],
                     },
                 );
                 assert_eq!(
@@ -2313,7 +2290,6 @@ mod tests {
                     video_packet_size: 1280,
                     rtcp_on_sctp: true,
                     microphone_available: false,
-                    offer: &[],
                 },
             );
             assert_eq!(
@@ -2375,14 +2351,30 @@ mod tests {
     }
 
     #[test]
-    fn seat_offer_color_values_replace_ours_without_adding_keys() {
+    fn seat_offer_color_values_are_logged_but_never_applied() {
         let mut value = context();
         value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!("10bit_444");
-        let offer = vec![
-            ("x-nv-video[0].chromaFormat".to_owned(), "3".to_owned()),
-            ("x-nv-video[0].bitDepth".to_owned(), "10".to_owned()),
-            ("x-nv-video[0].notEmitted".to_owned(), "9".to_owned()),
-        ];
+        // The DESCRIBE the seat proposed: its own 8-bit 4:2:0 defaults plus
+        // keys outside the allowlist — the values whose application in the
+        // 2026-09-24 session left the decoder without a presentable frame.
+        let describe = "a=x-nv-video[0].chromaFormat:3\r\na=x-nv-video[0].bitDepth:8\r\n\
+                        a=x-nv-vqos[0].H265BitStreamProfile:1\r\n\
+                        a=x-nv-video[0].notEmitted:9\r\n\
+                        a=x-nv-video[0].unrelated:7\r\n";
+        // Offered values are parsed for the payload-free diagnostic line only,
+        // in allowlist order; keys outside it are never surfaced.
+        assert_eq!(
+            describe_color_offer(describe),
+            vec![
+                "video[0].bitDepth=8".to_owned(),
+                "video[0].chromaFormat=3".to_owned(),
+                "vqos[0].H265BitStreamProfile=1".to_owned(),
+            ]
+        );
+        assert_eq!(describe_color_offer(""), vec!["none".to_owned()]);
+
+        // The ANNOUNCE keeps OpenNOW's own settings-derived values, exactly
+        // once each, regardless of what the seat offered.
         let sdp = build_announce(
             &value,
             AnnounceParams {
@@ -2398,35 +2390,25 @@ mod tests {
                 video_packet_size: 1280,
                 rtcp_on_sctp: true,
                 microphone_available: false,
-                offer: &offer,
             },
         );
-        // Offered values replace ours, exactly once each.
         assert_eq!(
             sdp_attribute(&sdp, "video[0].chromaFormat"),
-            Some("3".to_owned())
+            Some("1".to_owned()),
+            "the seat's chromaFormat:3 offer must not replace ours"
         );
         assert_eq!(sdp.matches("a=x-nv-video[0].chromaFormat:").count(), 1);
         assert_eq!(
             sdp_attribute(&sdp, "video[0].bitDepth"),
-            Some("10".to_owned())
+            Some("10".to_owned()),
+            "the seat's bitDepth:8 offer must not replace ours"
         );
-        // Keys we never emit are never added, even when offered.
+        assert!(
+            !sdp.contains("a=x-nv-video[0].bitDepth:8"),
+            "the offered 8-bit value must never reach the wire"
+        );
+        // Keys we never emit are never added.
         assert!(!sdp.contains("notEmitted"));
-
-        // The extractor reads the DESCRIBE body for exactly the allowlist.
-        let describe = "a=x-nv-video[0].chromaFormat:3\r\na=x-nv-vqos[0].H265BitStreamProfile:1\r\n\
-                        a=x-nv-video[0].unrelated:7\r\n";
-        assert_eq!(
-            offer_color_overrides(describe),
-            vec![
-                ("x-nv-video[0].chromaFormat".to_owned(), "3".to_owned()),
-                (
-                    "x-nv-vqos[0].H265BitStreamProfile".to_owned(),
-                    "1".to_owned()
-                ),
-            ]
-        );
     }
 
     #[test]

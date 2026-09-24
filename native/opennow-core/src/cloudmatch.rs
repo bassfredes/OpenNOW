@@ -4,7 +4,7 @@ use rand::RngCore as _;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, UdpSocket};
 use std::path::PathBuf;
@@ -59,6 +59,8 @@ pub struct CloudMatchService {
     fresh: Mutex<Option<FreshAllocation>>,
     cleanup_path: Option<PathBuf>,
     retained_cleanup: Mutex<Option<Value>>,
+    /// Sessions whose READY seat facts already reached the diagnostics log.
+    seat_facts_logged: Mutex<HashSet<String>>,
     #[cfg(test)]
     test_control_base: Option<Url>,
 }
@@ -119,6 +121,7 @@ impl CloudMatchService {
             fresh: Mutex::new(None),
             cleanup_path: None,
             retained_cleanup: Mutex::new(None),
+            seat_facts_logged: Mutex::new(HashSet::new()),
             #[cfg(test)]
             test_control_base: None,
         }
@@ -288,6 +291,11 @@ impl CloudMatchService {
             .or_else(|| base.host_str().map(ToOwned::to_owned))
             .unwrap_or_default();
         let mut info = session_info(&payload, &base, &zone, &app_id, device_id)?;
+        self.log_ready_seat_facts_once(
+            info["sessionId"].as_str().unwrap_or_default(),
+            &payload["session"],
+            &zone,
+        );
         if let Some(session_id) = network_test["sessionId"].as_str() {
             info["networkTestSessionId"] = json!(session_id);
         }
@@ -539,6 +547,7 @@ impl CloudMatchService {
 
         info["phase"] =
             Value::String(session_phase(info["status"].as_i64().unwrap_or_default()).to_owned());
+        self.log_ready_seat_facts_once(&session_id, &payload["session"], &zone);
         if current
             .as_ref()
             .is_some_and(|state| state.info["resumePending"] == true)
@@ -1067,6 +1076,23 @@ impl CloudMatchService {
             Value::String(session_phase(info["status"].as_i64().unwrap_or_default()).to_owned());
         self.store_active(&mut info, &base, zone, app_id, client)?;
         Ok(json!({"session":info}))
+    }
+
+    /// Emit the payload-free seat facts exactly once per session, on the
+    /// first READY (status 2) response observed for it.
+    fn log_ready_seat_facts_once(&self, session_id: &str, session: &Value, zone: &str) {
+        if session_id.is_empty() || value_i64(&session["status"]) != Some(2) {
+            return;
+        }
+        if !self
+            .seat_facts_logged
+            .lock()
+            .expect("CloudMatch seat facts poisoned")
+            .insert(session_id.to_owned())
+        {
+            return;
+        }
+        eprintln!("{}", session_seat_facts(session, zone));
     }
 
     fn store_active(
@@ -2290,6 +2316,37 @@ fn session_phase(status: i64) -> &'static str {
     }
 }
 
+/// Payload-free seat/session facts for the core diagnostics log (directive):
+/// seat GPU, finalized monitor/streaming configuration and the zone/server
+/// hostname, to correlate 4:4:4 availability with the seat GPU. Only the
+/// allowlisted config fields below leave this function: no IPs, no tokens,
+/// no deviceHashId.
+fn session_seat_facts(session: &Value, zone: &str) -> Value {
+    // Indexing a missing or null entry yields Null, so a session whose seat
+    // has not finalized monitor settings still logs a well-formed event.
+    let monitor = &session["monitorSettings"][0];
+    json!({
+        "event":"session_seat_facts",
+        "sessionId":session["sessionId"],
+        "gpuType":session["gpuType"],
+        "finalSelectedScreenResolution":session["finalSelectedScreenResolution"],
+        "monitorSettings":{
+            "width":monitor["widthInPixels"],
+            "height":monitor["heightInPixels"],
+            "fps":monitor["framesPerSecond"],
+            "sdrHdrMode":monitor["sdrHdrMode"],
+            "dpi":monitor["dpi"]
+        },
+        "finalizedStreamingFeatures":session["finalizedStreamingFeatures"],
+        "enhancedStreamMode":session["enhancedStreamMode"],
+        "zone":zone,
+        // The control endpoint carries a zone hostname on official sessions;
+        // anything that is not one (a real IP) is dropped rather than logged.
+        "serverHostname":first_string(&session["sessionControlInfo"]["ip"])
+            .filter(|host| is_zone_hostname(host))
+    })
+}
+
 fn cancelled_allocation() -> ServiceError {
     ServiceError {
         code: "cancelled",
@@ -2728,6 +2785,52 @@ mod tests {
             requests
         });
         (base, worker)
+    }
+
+    #[test]
+    fn seat_facts_log_only_payload_free_ready_fields() {
+        let ready = json!({
+            "sessionId":"seat-facts",
+            "status":2,
+            "gpuType":"5080h / B40",
+            "finalSelectedScreenResolution":Value::Null,
+            "enhancedStreamMode":0,
+            "monitorSettings":[{"monitorId":0,"widthInPixels":5120,"heightInPixels":2880,
+                "framesPerSecond":120,"sdrHdrMode":1,"dpi":267,"positionX":0,"positionY":0,
+                "displayData":{"edid":"display-secret"}}],
+            "finalizedStreamingFeatures":{"bitDepth":1,"chromaFormat":1,"enabledL4S":true},
+            "sessionControlInfo":{"ip":"np-lon-06.cloudmatchbeta.nvidiagrid.net"},
+            "clientIp":"203.0.113.9",
+            "sessionRequestData":{"deviceHashId":"device-secret","appId":"123"}
+        });
+        let facts = session_seat_facts(&ready, "np-lon-05.cloudmatchbeta.nvidiagrid.net");
+        assert_eq!(
+            facts,
+            json!({
+                "event":"session_seat_facts",
+                "sessionId":"seat-facts",
+                "gpuType":"5080h / B40",
+                "finalSelectedScreenResolution":Value::Null,
+                "monitorSettings":{"width":5120,"height":2880,"fps":120,"sdrHdrMode":1,"dpi":267},
+                "finalizedStreamingFeatures":{"bitDepth":1,"chromaFormat":1,"enabledL4S":true},
+                "enhancedStreamMode":0,
+                "zone":"np-lon-05.cloudmatchbeta.nvidiagrid.net",
+                "serverHostname":"np-lon-06.cloudmatchbeta.nvidiagrid.net"
+            })
+        );
+        let logged = facts.to_string();
+        assert!(!logged.contains("device-secret"));
+        assert!(!logged.contains("203.0.113.9"));
+        assert!(!logged.contains("display-secret"));
+
+        // A numeric control endpoint never leaks an IP, and a seat without
+        // finalized monitor settings still logs a well-formed event.
+        let mut ip_session = ready;
+        ip_session["sessionControlInfo"]["ip"] = json!("198.51.100.7");
+        ip_session["monitorSettings"] = Value::Null;
+        let facts = session_seat_facts(&ip_session, "zone");
+        assert_eq!(facts["serverHostname"], Value::Null);
+        assert_eq!(facts["monitorSettings"]["width"], Value::Null);
     }
 
     #[test]
