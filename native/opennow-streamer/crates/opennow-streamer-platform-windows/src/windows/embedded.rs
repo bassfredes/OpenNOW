@@ -3589,6 +3589,138 @@ mod tests {
         drop(frame);
     }
 
+    /// Drives the same path a live 5120x2880 4:4:4 session start takes:
+    /// `Decoder::new` under the live environment flag (as
+    /// Start-OpenNOW-444.ps1 sets it), bitstream selection on the first
+    /// access unit, then submit/poll_output exactly like the embedded worker.
+    /// Not a probe: the full enum-driven live route must create D3D11VA and
+    /// present frames.
+    #[cfg(feature = "nvdec-experiment")]
+    #[test]
+    fn live_5k_444_session_start_routes_d3d11va_and_presents_frames() {
+        let _runtime = EmbeddedMediaRuntime::initialize().expect("Media Foundation");
+        let mut device: Option<::windows::Win32::Graphics::Direct3D11::ID3D11Device> = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .expect("D3D11 hardware device");
+        }
+        let device = device.unwrap();
+        let context = context.unwrap();
+        let format = VideoFormat {
+            width: 5120,
+            height: 2880,
+            pixel_format: VideoPixelFormat::Y410,
+            chroma_format: VideoChromaFormat::Cs444,
+            transfer_function: VideoTransferFunction::Pq,
+            color_primaries: crate::VideoColorPrimaries::Bt2020,
+            color_matrix: VideoColorMatrix::Bt2020,
+            ..color_test_format()
+        };
+        format.validate().expect("5K HDR 4:4:4 format");
+        let resources = unsafe {
+            AdoptedResources::new(
+                AdoptedD3d11Context {
+                    device: device.as_raw(),
+                    immediate_context: context.as_raw(),
+                },
+                format,
+            )
+        }
+        .unwrap();
+        let previous_flag = std::env::var("OPENNOW_EXPERIMENTAL_NVDEC444").ok();
+        unsafe { std::env::set_var("OPENNOW_EXPERIMENTAL_NVDEC444", "1") };
+        let outcome = run_live_5k_session(&resources, format);
+        match previous_flag {
+            Some(value) => unsafe { std::env::set_var("OPENNOW_EXPERIMENTAL_NVDEC444", &value) },
+            None => unsafe { std::env::remove_var("OPENNOW_EXPERIMENTAL_NVDEC444") },
+        }
+        outcome.expect("live 5K 4:4:4 session start must route and present");
+    }
+
+    #[cfg(feature = "nvdec-experiment")]
+    fn run_live_5k_session(
+        resources: &AdoptedResources,
+        format: VideoFormat,
+    ) -> Result<(), String> {
+        use super::super::nvdec::Decoder;
+        let mut decoder = Decoder::new(resources, format, WindowsDecoderMode::Hardware)?;
+        assert!(
+            matches!(decoder, Decoder::D3d11va(_)),
+            "live HEVC 4:4:4 creation must route to D3D11VA, not NVDEC/MF"
+        );
+        let data = include_bytes!("../../fixtures/probe/hevc-y410-5k-pq.hevc");
+        let units = annexb_access_units(data);
+        let events = crate::queue::BoundedQueue::new(64);
+        let mut output = VecDeque::new();
+        let mut presented = 0_usize;
+        let mut first_format: Option<VideoFormat> = None;
+        for (index, (unit, irap)) in units.iter().enumerate() {
+            let frame = EncodedVideoFrame {
+                codec: crate::VideoCodec::H265,
+                data: unit.to_vec(),
+                timestamp_100ns: index as i64 * (10_000_000 / 120),
+                duration_100ns: 10_000_000 / 120,
+                key_frame: *irap,
+                reset_decoder: false,
+            };
+            // The worker asks bitstream selection before each submit; when
+            // actual equals the requested 4:4:4 the route must be kept.
+            let selection = decoder.select_bitstream_decoder(
+                resources,
+                format,
+                WindowsDecoderMode::Hardware,
+                &frame,
+            )?;
+            assert!(
+                !selection,
+                "matching actual==requested 4:4:4 must keep the running route"
+            );
+            assert!(
+                matches!(decoder, Decoder::D3d11va(_)),
+                "route must stay D3D11VA after selection at frame {index}"
+            );
+            decoder.submit(frame)?;
+            loop {
+                let produced = decoder.poll_output(&mut output, &events)?;
+                while let Some(frame) = output.pop_front() {
+                    presented += 1;
+                    if first_format.is_none() {
+                        first_format = Some(frame.format);
+                    }
+                }
+                if produced == 0 {
+                    break;
+                }
+            }
+        }
+        // Live streams never end, so the decoder keeps its B-frame reorder
+        // tail; everything the pipeline could present must have the live
+        // Y410 5K format.
+        assert!(
+            presented + 16 >= units.len(),
+            "only {presented} of {} access units were presented",
+            units.len()
+        );
+        let presented_format = first_format.expect("at least one presented frame");
+        assert_eq!(presented_format.pixel_format, VideoPixelFormat::Y410);
+        assert_eq!(presented_format.chroma_format, VideoChromaFormat::Cs444);
+        assert_eq!(presented_format.width, 5120);
+        assert_eq!(presented_format.height, 2880);
+        decoder.stop();
+        Ok(())
+    }
+
     fn color_test_format() -> VideoFormat {
         VideoFormat {
             codec: crate::VideoCodec::H265,

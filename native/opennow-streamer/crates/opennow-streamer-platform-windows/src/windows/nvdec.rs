@@ -52,6 +52,12 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+#[cfg(test)]
+unsafe extern "C" {
+    fn on_nvdec_y410_shift(av_pix_fmt: i32) -> i32;
+    fn av_get_pix_fmt(name: *const std::ffi::c_char) -> i32;
+}
+
 #[cfg(feature = "nvdec-gpu-interop")]
 unsafe extern "C" {
     fn on_nvdec_enable_gpu(decoder: *mut c_void, device: *mut c_void) -> i32;
@@ -116,6 +122,23 @@ impl Decoder {
                 VideoPixelFormat::Ayuv | VideoPixelFormat::Y410
             )
         {
+            // The live embedded decoder takes the same zero-copy D3D11VA
+            // 4:4:4 route the Settings probe validated; NVDEC CPU-transfer is
+            // only a fallback when the driver route is unavailable or fails
+            // at open time.
+            match super::d3d11va::D3d11vaDecoder::new(g, format, mode) {
+                Ok(decoder) => {
+                    video_log!(
+                        "decoder route=D3D11VA 4:4:4 zero-copy {}x{}",
+                        format.width,
+                        format.height
+                    );
+                    return Ok(Self::D3d11va(decoder));
+                }
+                Err(message) => {
+                    video_log!("decoder route=NVDEC 4:4:4 fallback: {message}");
+                }
+            }
             return NvDecoder::new(g, format).map(Self::Nv);
         }
         MfDecoder::new(g, format, mode).map(Self::Mf)
@@ -679,6 +702,49 @@ pub(super) fn decoded_color(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sample values for the Y410 conversion shift: MSB (left)-aligned
+    /// formats — including the rebuilt FFmpeg's `yuv444p10msb` /
+    /// `yuv444p12msb` outputs — keep the code in the high bits, while the
+    /// LSB-aligned `yuv444p10le` needs no shift.
+    #[test]
+    fn nvdec_y410_shift_reproduces_sample_values_for_msb_and_lsb_formats() {
+        let msb10 = unsafe { av_get_pix_fmt(c"yuv444p10msb".as_ptr()) };
+        let msb12 = unsafe { av_get_pix_fmt(c"yuv444p12msb".as_ptr()) };
+        let lsb10 = unsafe { av_get_pix_fmt(c"yuv444p10le".as_ptr()) };
+        let packed16 = unsafe { av_get_pix_fmt(c"yuv444p16le".as_ptr()) };
+        let missing = unsafe { av_get_pix_fmt(c"no-such-pixel-format".as_ptr()) };
+        assert_ne!(msb10, missing, "FFmpeg must provide yuv444p10msb");
+        assert_ne!(msb12, missing, "FFmpeg must provide yuv444p12msb");
+        assert_ne!(lsb10, missing, "FFmpeg must provide yuv444p10le");
+        assert_ne!(packed16, missing, "FFmpeg must provide yuv444p16le");
+        let (shift_msb10, shift_msb12, shift_lsb10, shift_packed16) = unsafe {
+            (
+                on_nvdec_y410_shift(msb10),
+                on_nvdec_y410_shift(msb12),
+                on_nvdec_y410_shift(lsb10),
+                on_nvdec_y410_shift(packed16),
+            )
+        };
+        assert_eq!(shift_msb10, 6, "MSB 10-bit codes live at code << 6");
+        assert_eq!(shift_msb12, 6, "MSB 12-bit words downconvert with >> 6");
+        assert_eq!(shift_lsb10, 0, "LSB 10-bit codes need no shift");
+        assert_eq!(
+            shift_packed16, 6,
+            "cuvid packed16 keeps the historical shift"
+        );
+        // Stored words as the decoders produce them, and the Y410 codes they
+        // must yield after the shift.
+        let msb10_word: u16 = 876 << 6;
+        let msb12_word: u16 = 876 << 4;
+        let lsb10_word: u16 = 876;
+        let packed16_word: u16 = 876 << 6;
+        assert_eq!((msb10_word >> shift_msb10) as u32, 876);
+        assert_eq!((msb12_word >> shift_msb12) as u32, 876 >> 2);
+        assert_eq!((lsb10_word >> shift_lsb10) as u32, 876);
+        assert_eq!((packed16_word >> shift_packed16) as u32, 876);
+    }
+
     #[test]
     fn hevc_keyframe_layout_follows_the_bitstream_and_rejects_other_resolutions() {
         let samples: &[(&[u8], i32, i32, i32)] = &[

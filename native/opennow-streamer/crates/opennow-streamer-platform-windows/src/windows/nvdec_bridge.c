@@ -168,6 +168,19 @@ void on_nvdec_reset(ONNvdec *d) {
     av_frame_unref(d->hardware_frame);
 }
 
+/* Right shift that turns a decoded 4:4:4 word into the 10-bit Y410 code.
+ * MSB (left)-aligned formats — the rebuilt FFmpeg emits
+ * AV_PIX_FMT_YUV444P10MSB and, for 12-bit streams, YUV444P12MSB — store the
+ * code in the high bits (code << (16 - depth)): a 10-bit code lives at <<6,
+ * and a 12-bit code downconverts with the same >>6 (its top ten bits).
+ * LSB-aligned yuv444p10le needs no shift; yuv444p16le carries
+ * left-aligned data from cuvid and keeps the historical >>6. */
+int on_nvdec_y410_shift(int av_pix_fmt) {
+    return (av_pix_fmt == AV_PIX_FMT_YUV444P16LE ||
+            av_pix_fmt == AV_PIX_FMT_YUV444P10MSB ||
+            av_pix_fmt == AV_PIX_FMT_YUV444P12MSB) ? 6 : 0;
+}
+
 /* Returns 1 for one exact-format frame, 0 for no output, negative for failure. */
 int on_nvdec_receive(ONNvdec *d, uint32_t *out, size_t pixels, ONFrameInfo *info) {
     if (!d || !out || !info || pixels != (size_t)d->width*d->height) return -1;
@@ -214,7 +227,9 @@ int on_nvdec_receive(ONNvdec *d, uint32_t *out, size_t pixels, ONFrameInfo *info
     }
     if ((d->depth == 8 && f->format != AV_PIX_FMT_YUV444P) ||
         (d->depth == 10 && f->format != AV_PIX_FMT_YUV444P16LE &&
-         f->format != AV_PIX_FMT_YUV444P10LE)) return -3;
+         f->format != AV_PIX_FMT_YUV444P10LE &&
+         f->format != AV_PIX_FMT_YUV444P10MSB &&
+         f->format != AV_PIX_FMT_YUV444P12MSB)) return -3;
     info->output_layout = d->depth == 10 ? 1 : 0;
     for (int y = 0; y < d->height; ++y) {
         const uint8_t *yp = f->data[0] + (ptrdiff_t)y*f->linesize[0];
@@ -225,7 +240,7 @@ int on_nvdec_receive(ONNvdec *d, uint32_t *out, size_t pixels, ONFrameInfo *info
             for (int x = 0; x < d->width; ++x)
                 row[x] = 0xff000000u | ((uint32_t)yp[x]<<16) | ((uint32_t)up[x]<<8) | vp[x];
         } else {
-            int shift = f->format == AV_PIX_FMT_YUV444P16LE ? 6 : 0;
+            int shift = on_nvdec_y410_shift(f->format);
             for (int x = 0; x < d->width; ++x) {
                 uint32_t Y = ((const uint16_t *)yp)[x] >> shift;
                 uint32_t U = ((const uint16_t *)up)[x] >> shift;
