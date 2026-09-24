@@ -1617,10 +1617,7 @@ mod tests {
 
     #[test]
     fn mouse_settings_frame_is_byte_exact_accel_first() {
-        assert_eq!(
-            mouse_settings(10, 0, true),
-            hex("23030800000000000a000000")
-        );
+        assert_eq!(mouse_settings(10, 0, true), hex("23030800000000000a000000"));
     }
 
     #[test]
@@ -1659,8 +1656,11 @@ mod tests {
             std::env::remove_var("OPENNOW_MOUSE_SETTINGS");
         }
         assert_eq!(chain.len(), 8);
-        assert!(chain.iter().all(|message| !message
-            .starts_with(&COMMAND_MOUSE_SETTINGS.to_le_bytes())));
+        assert!(
+            chain
+                .iter()
+                .all(|message| !message.starts_with(&COMMAND_MOUSE_SETTINGS.to_le_bytes()))
+        );
     }
 
     #[test]

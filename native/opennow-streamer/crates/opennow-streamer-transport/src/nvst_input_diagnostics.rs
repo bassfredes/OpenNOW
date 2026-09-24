@@ -70,6 +70,22 @@ pub(crate) struct InputDiagnostics {
     /// Dequeue stamps awaiting the end-of-iteration flush stamp. Bounded:
     /// the oldest pending stamp is dropped when a single drain overshoots.
     pending_flush: VecDeque<Instant>,
+    /// One uninterrupted worker stretch between command drains (drain exit
+    /// to next drain entry): the number that answers how long an input send
+    /// can wait when it is queued mid-stretch.
+    worker_iteration: StageWindow,
+    /// Longest str0m `poll_output` drain in the window: transmits, control
+    /// events and video RTP events (Mjolnir FEC/decrypt/assembly).
+    poll_out_max_us: u64,
+    /// Longest end-of-iteration flush (the five-second report write itself).
+    flush_max_us: u64,
+    /// Longest receive wait + `handle_input` stretch.
+    recv_max_us: u64,
+    /// Longest keepalive/cursor/hid/ack/nack/stats/microphone stretch
+    /// between the drain and the poll_output loop.
+    other_max_us: u64,
+    /// Control-channel (bundle) hole-punch STUN round trips.
+    control_rtt: StageWindow,
     report_at: Option<Instant>,
 }
 
@@ -146,14 +162,41 @@ impl InputDiagnostics {
         self.pending_flush.push_back(dequeued_at);
     }
 
+    /// Records how long the worker ran uninterrupted between command
+    /// drains. Called at drain entry, so the sample excludes the drain
+    /// itself.
+    pub(crate) fn record_worker_iteration(&mut self, micros: u64) {
+        self.worker_iteration.record(micros);
+    }
+
+    pub(crate) fn note_poll_out(&mut self, micros: u64) {
+        self.poll_out_max_us = self.poll_out_max_us.max(micros);
+    }
+
+    pub(crate) fn note_flush(&mut self, micros: u64) {
+        self.flush_max_us = self.flush_max_us.max(micros);
+    }
+
+    pub(crate) fn note_recv(&mut self, micros: u64) {
+        self.recv_max_us = self.recv_max_us.max(micros);
+    }
+
+    pub(crate) fn note_other(&mut self, micros: u64) {
+        self.other_max_us = self.other_max_us.max(micros);
+    }
+
+    /// One control-channel hole-punch round trip.
+    pub(crate) fn record_control_rtt(&mut self, elapsed: Duration) {
+        self.control_rtt
+            .record(elapsed.as_micros().min(u64::MAX as u128) as u64);
+    }
+
     /// Closes every input dequeued since the previous flush: the worker has
     /// now packetized them through str0m and handed the datagrams to the UDP
     /// socket, so `now - dequeue` is the worker -> SCTP-send stage. Also
-    /// drives the five-second report.
+    /// drives the five-second report, which keeps firing during a render or
+    /// input stall so the worker instrumentation never goes silent.
     pub(crate) fn flush(&mut self, now: Instant) {
-        if self.pending_flush.is_empty() {
-            return;
-        }
         while let Some(dequeued_at) = self.pending_flush.pop_front() {
             let micros = now
                 .saturating_duration_since(dequeued_at)
@@ -166,16 +209,28 @@ impl InputDiagnostics {
             return;
         }
         let line = format!(
-            "NVST input stage-timings {} {} {}",
+            "NVST input stage-timings {} {} {} {} phaseMax{{pollOutUs={} flushUs={} recvUs={} otherUs={}}} controlRtt{}",
             self.submit_to_enqueue.summarize("submitToEnqueue"),
             self.enqueue_to_worker.summarize("enqueueToWorker"),
             self.dequeue_to_sctp.summarize("dequeueToSctp"),
+            self.worker_iteration.summarize("workerIter"),
+            self.poll_out_max_us,
+            self.flush_max_us,
+            self.recv_max_us,
+            self.other_max_us,
+            self.control_rtt.summarize("controlRtt"),
         );
         opennow_streamer_protocol::log::log_line("INFO", "input-stage-timings", &line);
         eprintln!("{line}");
         self.submit_to_enqueue.reset();
         self.enqueue_to_worker.reset();
         self.dequeue_to_sctp.reset();
+        self.worker_iteration.reset();
+        self.control_rtt.reset();
+        self.poll_out_max_us = 0;
+        self.flush_max_us = 0;
+        self.recv_max_us = 0;
+        self.other_max_us = 0;
         self.report_at = Some(now + REPORT_INTERVAL);
     }
 }
@@ -256,6 +311,42 @@ mod tests {
         assert_eq!(diagnostics.enqueue_to_worker.max_us, 7);
         assert_eq!(diagnostics.dequeue_to_sctp.count, 1);
         assert_eq!(diagnostics.dequeue_to_sctp.max_us, 2);
+    }
+
+    /// Worker-stretch, phase and control-RTT samples: recorded, bounded and
+    /// reset by the five-second report, which fires even with no inputs in
+    /// flight so a stalled worker still reports instead of going silent.
+    #[test]
+    fn worker_iterations_phases_and_control_rtt_report_and_reset() {
+        let mut diagnostics = InputDiagnostics::default();
+        for i in 0..10_u64 {
+            diagnostics.record_worker_iteration(100 + i);
+            diagnostics.note_poll_out(50 + i);
+            diagnostics.note_flush(7);
+            diagnostics.note_recv(11);
+            diagnostics.note_other(13);
+            diagnostics.record_control_rtt(Duration::from_millis(7));
+        }
+        assert_eq!(diagnostics.worker_iteration.max_us, 109);
+        assert_eq!(diagnostics.worker_iteration.count, 10);
+        assert_eq!(diagnostics.poll_out_max_us, 59);
+        assert_eq!(diagnostics.flush_max_us, 7);
+        assert_eq!(diagnostics.recv_max_us, 11);
+        assert_eq!(diagnostics.other_max_us, 13);
+        assert_eq!(diagnostics.control_rtt.max_us, 7_000);
+        assert_eq!(diagnostics.control_rtt.count, 10);
+
+        let now = Instant::now();
+        diagnostics.flush(now); // arms the five-second deadline
+        assert_eq!(diagnostics.worker_iteration.count, 10, "not due yet");
+        diagnostics.flush(now + Duration::from_secs(6)); // due: report + reset
+        assert!(diagnostics.worker_iteration.samples.is_empty());
+        assert_eq!(diagnostics.worker_iteration.count, 0);
+        assert!(diagnostics.control_rtt.samples.is_empty());
+        assert_eq!(diagnostics.poll_out_max_us, 0);
+        assert_eq!(diagnostics.flush_max_us, 0);
+        assert_eq!(diagnostics.recv_max_us, 0);
+        assert_eq!(diagnostics.other_max_us, 0);
     }
 
     /// The record must reach the durable sink without the opt-in flag, carry

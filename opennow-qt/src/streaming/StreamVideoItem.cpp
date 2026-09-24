@@ -55,6 +55,9 @@ StreamVideoItem::StreamVideoItem(std::unique_ptr<MacPointerCapture> pointerCaptu
             this, &StreamVideoItem::frameGenerationStatsChanged);
     m_swapStatsTimer.setInterval(1000);
     connect(&m_swapStatsTimer, &QTimer::timeout, this, &StreamVideoItem::swapStatsChanged);
+    connect(&m_swapStatsTimer, &QTimer::timeout, this, [this] {
+        if (++m_renderLogTick % 5 == 0) logRenderSummary();
+    });
     connect(this, &QQuickItem::visibleChanged, this, &StreamVideoItem::updateSwapGate,
             Qt::UniqueConnection);
     if (s_nativeRuntime) {
@@ -94,6 +97,12 @@ StreamVideoItem::StreamVideoItem(std::unique_ptr<MacPointerCapture> pointerCaptu
                     this, &StreamVideoItem::syncCaptureState, Qt::UniqueConnection);
             connect(currentWindow, &QWindow::visibilityChanged,
                     this, &StreamVideoItem::updateSwapGate, Qt::UniqueConnection);
+            connect(currentWindow, &QWindow::activeChanged, this,
+                    [this] { logWindowState("active-changed"); }, Qt::UniqueConnection);
+            connect(currentWindow, &QWindow::visibilityChanged, this,
+                    [this] { logWindowState("visibility-changed"); }, Qt::UniqueConnection);
+            connect(currentWindow, &QWindow::windowStateChanged, this,
+                    [this] { logWindowState("window-state-changed"); }, Qt::UniqueConnection);
             connect(currentWindow, &QWindow::xChanged,
                     this, &StreamVideoItem::updateCursorConfinement, Qt::UniqueConnection);
             connect(currentWindow, &QWindow::yChanged,
@@ -410,6 +419,49 @@ void StreamVideoItem::requestFrame()
         return;
     }
     update();
+}
+
+void StreamVideoItem::logWindowState(const char *event)
+{
+    const auto *currentWindow = window();
+    if (!currentWindow) return;
+    // Qt's own scenegraph debug log (QT_LOGGING_RULES in
+    // Start-OpenNOW-444.ps1) already records animation-driver
+    // vsync<->timer switches; these events give the window side of the
+    // correlation without hooking Qt's private swapchain Present.
+    qInfo("render-window event=%s active=%d visible=%d minimized=%d exposed=%d windowState=0x%x",
+          event, int(currentWindow->isActive()), int(currentWindow->isVisible()),
+          int(bool(currentWindow->windowState() & Qt::WindowMinimized)),
+          int(currentWindow->isExposed()), int(currentWindow->windowState()));
+}
+
+void StreamVideoItem::logRenderSummary()
+{
+    if (!m_renderCallback) return;
+    const auto swaps = swapStats();
+    const auto generation = frameGenerationStats();
+    const auto gpu = swaps.value(QStringLiteral("gpuDownscaleUs")).toMap();
+    const auto *currentWindow = window();
+    qInfo("render-qt stage-timings outputFps=%.1f submitToSwap{p50Ms=%.2f p95Ms=%.2f maxMs=%.2f} "
+          "sinceLastSwapMs=%.1f swappedTotal=%llu swapEpoch=%llu gated=%d gateSource=%s "
+          "win{active=%d visible=%d minimized=%d} "
+          "gpuDownscaleUs{p50=%lld p95=%lld max=%lld n=%d}",
+          generation.value(QStringLiteral("outputFps")).toDouble(),
+          swaps.value(QStringLiteral("p50Ms")).toDouble(),
+          swaps.value(QStringLiteral("p95Ms")).toDouble(),
+          swaps.value(QStringLiteral("maxMs")).toDouble(),
+          swaps.value(QStringLiteral("sinceLastSwapMs")).toDouble(),
+          qulonglong(swaps.value(QStringLiteral("swappedFramesTotal")).toULongLong()),
+          qulonglong(swaps.value(QStringLiteral("epoch")).toULongLong()),
+          int(!m_swapGateSource.isEmpty()),
+          m_swapGateSource.isEmpty() ? "-" : qPrintable(m_swapGateSource),
+          int(currentWindow && currentWindow->isActive()),
+          int(currentWindow && currentWindow->isVisible()),
+          int(currentWindow && bool(currentWindow->windowState() & Qt::WindowMinimized)),
+          gpu.value(QStringLiteral("p50Us")).toLongLong(),
+          gpu.value(QStringLiteral("p95Us")).toLongLong(),
+          gpu.value(QStringLiteral("maxUs")).toLongLong(),
+          gpu.value(QStringLiteral("n")).toInt());
 }
 
 QRect StreamVideoItem::aspectFitRect(const QSize &videoSize, const QSize &targetSize)

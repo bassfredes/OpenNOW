@@ -189,6 +189,13 @@ private:
     void updateLocalCursor();
     void syncCaptureState();
     void connectFrameSwaps();
+    /// Payload-free window-state event for the render-starvation
+    /// investigation (activate/deactivate, visibility, minimize, expose).
+    void logWindowState(const char *event);
+    /// One rate-limited present summary every five seconds, stage_timing
+    /// style: swap cadence, submit-to-swap, window state and the downscale
+    /// pass's GPU time.
+    void logRenderSummary();
     void releaseInput();
     void releaseQtMouseButtons();
     void updateCursorConfinement();
@@ -227,6 +234,7 @@ private:
     bool m_absoluteCursorOnHidden = true;
     QTimer m_frameStatsTimer;
     QTimer m_swapStatsTimer;
+    int m_renderLogTick = 0;
     QString m_swapGateSource;
     QMetaObject::Connection m_frameSwapConnection;
     QMetaObject::Connection m_frameUpdateConnection;

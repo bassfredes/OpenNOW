@@ -907,6 +907,7 @@ impl D3d11Frame {
     ) -> Result<D3d11RecordedFrame, BackendError> {
         // Last in-process stage before Present: Qt is about to compose this frame.
         super::stage_timing::record_present(self.frame.timestamp_100ns);
+        super::render_timing::note_presented();
         let mut state = self
             .state
             .lock()
@@ -1059,7 +1060,9 @@ impl D3d11Pipeline {
             return Ok(None);
         };
         if !decoded.is_empty() {
+            let superseded = decoded.len();
             decoded.clear();
+            super::render_timing::note_superseded(superseded);
             let _ = self
                 .events
                 .push(BackendEvent::QueueOverflow(Subsystem::VideoPresentation));
@@ -1177,6 +1180,7 @@ fn run_decoder_worker(
         && std::env::var("OPENNOW_NVDEC_NATIVE_420").as_deref() == Ok("1");
     while !stopping.load(Ordering::Acquire) {
         super::stage_timing::maybe_report(Instant::now());
+        super::render_timing::maybe_report(Instant::now());
         let mut made_progress = false;
         output.clear();
         match decoder.poll_output(&mut output, &events) {

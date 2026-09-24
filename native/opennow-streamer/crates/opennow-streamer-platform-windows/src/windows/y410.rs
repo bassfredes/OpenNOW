@@ -31,6 +31,7 @@ pub(super) struct Y410Converter {
     rasterizer: ID3D11RasterizerState,
     slots: [Option<OutputSlot>; MAX_FRAME_SLOTS],
     format: VideoFormat,
+    gpu: GpuTimer,
 }
 impl Y410Converter {
     pub(super) fn new(
@@ -219,6 +220,7 @@ impl Y410Converter {
             rasterizer: rasterizer.ok_or("no Y410 rasterizer")?,
             slots: std::array::from_fn(|_| None),
             format,
+            gpu: GpuTimer::new(device),
         })
     }
     pub(super) fn record(
@@ -229,13 +231,19 @@ impl Y410Converter {
         if slot >= MAX_FRAME_SLOTS || frame.format != self.format {
             return Err("Y410 converter frame or slot mismatch".to_owned());
         }
+        let record_started = std::time::Instant::now();
         // Serialize with the D3D11VA decoder's device callbacks (the shared
         // immediate-context lock): the render-thread conversion must never
         // interleave its copy/draw/execute with worker-thread decode
         // submissions — the live-only block-smear hypothesis. Offline tests
         // run single-threaded and cannot see that race.
         #[cfg(feature = "nvdec-experiment")]
-        let _shared_context_lock = super::d3d11va::SharedContextLock::acquire();
+        let _shared_context_lock = {
+            let started = std::time::Instant::now();
+            let guard = super::d3d11va::SharedContextLock::acquire();
+            super::render_timing::record_lock_wait_us(super::render_timing::micros_since(started));
+            guard
+        };
         if self.slots[slot].is_none() {
             let mut texture = None;
             let mut view = None;
@@ -346,12 +354,20 @@ impl Y410Converter {
             self.deferred
                 .FinishCommandList(false, Some(&mut commands))
                 .map_err(|error| format!("finish Y410 conversion commands: {error}"))?;
-            self.immediate
-                .ExecuteCommandList(&commands.ok_or("no Y410 conversion commands")?, true);
+            let commands = commands.ok_or("no Y410 conversion commands")?;
+            // Bracket the conversion's GPU execution with timestamp queries;
+            // the ring is read back several frames later with the non-blocking
+            // flag, so no path ever waits on the GPU for diagnostics.
+            self.gpu.begin(&self.immediate);
+            let started = std::time::Instant::now();
+            self.immediate.ExecuteCommandList(&commands, true);
+            super::render_timing::record_execute_us(super::render_timing::micros_since(started));
+            self.gpu.end(&self.immediate);
             self.device
                 .GetDeviceRemovedReason()
                 .map_err(|error| format!("Y410 conversion device lost: {error}"))?;
         }
+        super::render_timing::record_record_us(super::render_timing::micros_since(record_started));
         Ok(&output.texture)
     }
 }
@@ -387,4 +403,148 @@ fn compile(entry: &std::ffi::CStr, target: &std::ffi::CStr) -> Result<ID3DBlob, 
         return Err(format!("compile Y410 shader: {error}: {detail}"));
     }
     code.ok_or_else(|| "no Y410 shader bytecode".to_owned())
+}
+
+/// Ring of D3D11 timestamp queries measuring the conversion's GPU time on the
+/// shared immediate context: `Begin(disjoint) -> End(t0) -> conversion ->
+/// End(t1) -> End(disjoint)`, then read back `GPU_TIMER_RING` frames later
+/// with `D3D11_ASYNC_GETDATA_DONOTWAIT`. A result that is not ready leaves the
+/// sentinel buffers untouched and the sample is skipped — no path ever waits
+/// on the GPU for diagnostics. Query-creation failure leaves the timer inert;
+/// instrumentation must never break presentation.
+const GPU_TIMER_RING: usize = 8;
+
+struct GpuTimer {
+    disjoint: [Option<ID3D11Query>; GPU_TIMER_RING],
+    start: [Option<ID3D11Query>; GPU_TIMER_RING],
+    end: [Option<ID3D11Query>; GPU_TIMER_RING],
+    armed: [bool; GPU_TIMER_RING],
+    cursor: usize,
+}
+
+impl GpuTimer {
+    fn new(device: &ID3D11Device) -> Self {
+        let create = |query_type: D3D11_QUERY| -> Option<ID3D11Query> {
+            let mut query: Option<ID3D11Query> = None;
+            let description = D3D11_QUERY_DESC {
+                Query: query_type,
+                MiscFlags: 0,
+            };
+            unsafe { device.CreateQuery(&description, Some(&mut query)) }.ok()?;
+            query
+        };
+        Self {
+            disjoint: std::array::from_fn(|_| create(D3D11_QUERY_TIMESTAMP_DISJOINT)),
+            start: std::array::from_fn(|_| create(D3D11_QUERY_TIMESTAMP)),
+            end: std::array::from_fn(|_| create(D3D11_QUERY_TIMESTAMP)),
+            armed: [false; GPU_TIMER_RING],
+            cursor: 0,
+        }
+    }
+
+    fn slot_queries(&self, slot: usize) -> Option<(&ID3D11Query, &ID3D11Query, &ID3D11Query)> {
+        Some((
+            self.disjoint.get(slot)?.as_ref()?,
+            self.start.get(slot)?.as_ref()?,
+            self.end.get(slot)?.as_ref()?,
+        ))
+    }
+
+    /// Resolves the slot's previous cycle (issued eight frames ago) without
+    /// blocking, then opens the next timing scope.
+    fn begin(&mut self, context: &ID3D11DeviceContext) {
+        let slot = self.cursor;
+        self.try_collect(context, slot);
+        let Some((disjoint, start, _)) = self.slot_queries(slot) else {
+            return;
+        };
+        unsafe {
+            context.Begin(disjoint);
+            context.End(start);
+        }
+        self.armed[slot] = true;
+    }
+
+    fn end(&mut self, context: &ID3D11DeviceContext) {
+        let slot = self.cursor;
+        if !self.armed[slot] {
+            return;
+        }
+        self.armed[slot] = false;
+        if let Some((disjoint, _, end)) = self.slot_queries(slot) {
+            unsafe {
+                context.End(end);
+                context.End(disjoint);
+            }
+        }
+        self.cursor = (slot + 1) % GPU_TIMER_RING;
+    }
+
+    fn try_collect(&self, context: &ID3D11DeviceContext, slot: usize) {
+        if self.armed[slot] {
+            // The previous cycle for this slot never closed; re-arm instead
+            // of reading half-written data.
+            return;
+        }
+        let Some((disjoint, start, end)) = self.slot_queries(slot) else {
+            return;
+        };
+        // `GetData` reports "not ready" as S_FALSE, which the binding maps to
+        // success with the buffers left untouched — the sentinels decide.
+        // D3D11 GetData is non-blocking by default; DONOTFLUSH keeps it from
+        // forcing pipeline completion, so nothing ever waits on the GPU here.
+        let mut disjoint_data = D3D11_QUERY_DATA_TIMESTAMP_DISJOINT {
+            Frequency: 0,
+            Disjoint: true.into(),
+        };
+        let mut start_data = u64::MAX;
+        let mut end_data = u64::MAX;
+        let flags = D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32;
+        unsafe {
+            if context
+                .GetData(
+                    disjoint,
+                    Some(std::ptr::from_mut(&mut disjoint_data).cast()),
+                    u32::try_from(std::mem::size_of::<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>())
+                        .unwrap_or(0),
+                    flags,
+                )
+                .is_err()
+            {
+                return;
+            }
+            if context
+                .GetData(
+                    start,
+                    Some(std::ptr::from_mut(&mut start_data).cast()),
+                    u32::try_from(std::mem::size_of::<u64>()).unwrap_or(0),
+                    flags,
+                )
+                .is_err()
+            {
+                return;
+            }
+            if context
+                .GetData(
+                    end,
+                    Some(std::ptr::from_mut(&mut end_data).cast()),
+                    u32::try_from(std::mem::size_of::<u64>()).unwrap_or(0),
+                    flags,
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+        if disjoint_data.Frequency == 0
+            || disjoint_data.Disjoint.as_bool()
+            || start_data == u64::MAX
+            || end_data == u64::MAX
+            || end_data < start_data
+        {
+            return;
+        }
+        let micros = (end_data - start_data) as u128 * 1_000_000 / disjoint_data.Frequency as u128;
+        super::render_timing::record_gpu_convert_us(micros.min(u64::MAX as u128) as u64);
+    }
 }

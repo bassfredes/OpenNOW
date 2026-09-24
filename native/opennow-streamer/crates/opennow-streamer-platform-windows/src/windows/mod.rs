@@ -17,6 +17,7 @@ mod embedded;
 mod graphics;
 #[cfg(feature = "nvdec-experiment")]
 mod nvdec;
+mod render_timing;
 mod stage_timing;
 mod y410;
 

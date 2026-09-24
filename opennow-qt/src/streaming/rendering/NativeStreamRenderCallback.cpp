@@ -18,6 +18,11 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <vector>
+#if defined(Q_OS_WIN)
+#include <d3d11.h>
+#include <wrl/client.h>
+#endif
 
 namespace {
 class ExternalCommandScope final
@@ -40,6 +45,141 @@ public:
 private:
     QRhiCommandBuffer *m_commandBuffer;
 };
+
+#if defined(Q_OS_WIN)
+// GPU timing for the streamvideo downscale draw. QRhi's D3D11 backend
+// executes command-buffer draws on the adopted immediate context as they are
+// recorded, so raw timestamp queries bracketing the draw measure the pass's
+// GPU time. Each slot is read back eight frames later with
+// D3D11_ASYNC_GETDATA_DONOTFLUSH; a result that is not ready is skipped,
+// never waited on, so diagnostics can never stall the render thread.
+class D3D11DownscaleGpuTimer final
+{
+public:
+    static constexpr int Ring = 8;
+
+    struct Stats
+    {
+        qint64 p50Us = 0;
+        qint64 p95Us = 0;
+        qint64 maxUs = 0;
+        int n = 0;
+    };
+
+    void initialize(ID3D11Device *device, ID3D11DeviceContext *context)
+    {
+        release();
+        m_device = device;
+        m_context = context;
+        if (!m_device || !m_context) return;
+        for (int slot = 0; slot < Ring; ++slot) {
+            m_disjoint[slot] = create(D3D11_QUERY_TIMESTAMP_DISJOINT);
+            m_start[slot] = create(D3D11_QUERY_TIMESTAMP);
+            m_end[slot] = create(D3D11_QUERY_TIMESTAMP);
+        }
+    }
+
+    void release()
+    {
+        for (int slot = 0; slot < Ring; ++slot) {
+            m_disjoint[slot].Reset();
+            m_start[slot].Reset();
+            m_end[slot].Reset();
+            m_armed[slot] = false;
+        }
+        m_cursor = 0;
+        m_device = nullptr;
+        m_context = nullptr;
+        m_samples.clear();
+    }
+
+    void begin()
+    {
+        if (!m_context) return;
+        const int slot = m_cursor;
+        collect(slot);
+        if (!m_disjoint[slot] || !m_start[slot] || !m_end[slot]) return;
+        m_context->Begin(m_disjoint[slot].Get());
+        m_context->End(m_start[slot].Get());
+        m_armed[slot] = true;
+    }
+
+    void end()
+    {
+        if (!m_context) return;
+        const int slot = m_cursor;
+        if (!m_armed[slot]) return;
+        m_armed[slot] = false;
+        if (m_end[slot] && m_disjoint[slot]) {
+            m_context->End(m_end[slot].Get());
+            m_context->End(m_disjoint[slot].Get());
+        }
+        m_cursor = (slot + 1) % Ring;
+    }
+
+    Stats stats() const
+    {
+        Stats result;
+        result.n = int(m_samples.size());
+        if (m_samples.empty()) return result;
+        std::vector<qint64> sorted = m_samples;
+        std::sort(sorted.begin(), sorted.end());
+        const auto at = [&sorted](double fraction) {
+            const size_t index = size_t(sorted.size() * fraction);
+            return sorted[index < sorted.size() ? index : sorted.size() - 1];
+        };
+        result.p50Us = at(0.50);
+        result.p95Us = at(0.95);
+        result.maxUs = sorted.back();
+        return result;
+    }
+
+private:
+    Microsoft::WRL::ComPtr<ID3D11Query> create(D3D11_QUERY type)
+    {
+        Microsoft::WRL::ComPtr<ID3D11Query> query;
+        if (!m_device) return query;
+        D3D11_QUERY_DESC description{};
+        description.Query = type;
+        m_device->CreateQuery(&description, &query);
+        return query;
+    }
+
+    void collect(int slot)
+    {
+        // Only resolve a slot whose previous cycle closed; GetData with
+        // DONOTFLUSH returns S_FALSE while pending and leaves the buffers
+        // untouched, so the zeroed sentinel decides.
+        if (!m_context || m_armed[slot]) return;
+        if (!m_disjoint[slot] || !m_start[slot] || !m_end[slot]) return;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+        UINT64 start = 0;
+        UINT64 end = 0;
+        const auto flags = D3D11_ASYNC_GETDATA_DONOTFLUSH;
+        if (m_context->GetData(m_disjoint[slot].Get(), &disjoint, sizeof(disjoint), flags) != S_OK)
+            return;
+        if (m_context->GetData(m_start[slot].Get(), &start, sizeof(start), flags) != S_OK)
+            return;
+        if (m_context->GetData(m_end[slot].Get(), &end, sizeof(end), flags) != S_OK)
+            return;
+        if (disjoint.Frequency == 0 || disjoint.Disjoint || start == 0 || end < start)
+            return;
+        const UINT64 micros = (end - start) * 1000000ull / disjoint.Frequency;
+        if (m_samples.size() >= 256)
+            m_samples.erase(m_samples.begin());
+        m_samples.push_back(qint64(micros));
+    }
+
+    ID3D11Device *m_device = nullptr;
+    ID3D11DeviceContext *m_context = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11Query> m_disjoint[Ring];
+    Microsoft::WRL::ComPtr<ID3D11Query> m_start[Ring];
+    Microsoft::WRL::ComPtr<ID3D11Query> m_end[Ring];
+    bool m_armed[Ring] = {};
+    int m_cursor = 0;
+    std::vector<qint64> m_samples;
+};
+#endif
 
 class NativeStreamRenderCallback final : public StreamVideoRenderCallback
 {
@@ -85,6 +225,11 @@ public:
                 context.graphics_api = OPENNOW_STREAMER_GRAPHICS_API_D3D11;
                 context.device = handles->dev;
                 context.queue = handles->context;
+                // The public QRhi native-handles header type-erases these to
+                // void*; the D3D11 backend always hands out the real
+                // device/immediate-context pointers.
+                m_downscaleGpu.initialize(static_cast<ID3D11Device *>(handles->dev),
+                                          static_cast<ID3D11DeviceContext *>(handles->context));
                 break;
             }
 #endif
@@ -402,6 +547,17 @@ public:
         if (snapshot.hasLastSwap)
             stats.insert(QStringLiteral("sinceLastSwapMs"),
                          double(clockNs() - snapshot.lastSwapNs) / 1.0e6);
+#if defined(Q_OS_WIN)
+        const auto gpu = m_downscaleGpu.stats();
+        QVariantMap gpuStats;
+        gpuStats.insert(QStringLiteral("p50Us"), gpu.p50Us);
+        gpuStats.insert(QStringLiteral("p95Us"), gpu.p95Us);
+        gpuStats.insert(QStringLiteral("maxUs"), gpu.maxUs);
+        gpuStats.insert(QStringLiteral("n"), gpu.n);
+        stats.insert(QStringLiteral("gpuDownscaleUs"), gpuStats);
+#else
+        stats.insert(QStringLiteral("gpuDownscaleUs"), QVariantMap());
+#endif
         return stats;
     }
 
@@ -470,7 +626,13 @@ public:
     {
         if (!m_runtime || !m_runtime->presentationAllowed()
                 || m_presentationGeneration != m_runtime->presentationGeneration()) return;
+#if defined(Q_OS_WIN)
+        m_downscaleGpu.begin();
+#endif
         m_textures.render(commandBuffer, m_stencil, m_stencilReference);
+#if defined(Q_OS_WIN)
+        m_downscaleGpu.end();
+#endif
         if (m_outputDirty) {
             m_submittedKind.store(m_outputKind);
             m_outputDirty = false;
@@ -498,6 +660,7 @@ public:
         m_textures.release();
         m_interpolator.release();
         m_pacer.reset();
+        m_downscaleGpu.release();
         m_swapTimings.reset();
         updateTimingStats();
         m_needsFrame.store(false);
@@ -549,6 +712,9 @@ private:
     int m_reportedOutputBits = 0;
     StreamVideoTextureRenderer m_textures;
     StreamPresentTimings m_swapTimings;
+#if defined(Q_OS_WIN)
+    D3D11DownscaleGpuTimer m_downscaleGpu;
+#endif
     StreamSwapStallWatchdog m_swapStall;
     bool m_swapGateActive = false;
     bool m_resourceRearmPending = false;

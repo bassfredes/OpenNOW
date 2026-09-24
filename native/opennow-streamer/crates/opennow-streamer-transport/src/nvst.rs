@@ -176,6 +176,30 @@ impl StreamPingTracker {
     }
 }
 
+/// Takes at most `limit` currently queued commands without blocking, and
+/// reports whether the channel had already disconnected. The bound keeps
+/// a large input burst from monopolizing the receive worker between
+/// video packets; leftovers stay queued for the next interleave point.
+fn take_command_batch(
+    commands: &Receiver<UdpReceiverCommand>,
+    limit: usize,
+) -> (Vec<UdpReceiverCommand>, bool) {
+    let mut batch = Vec::with_capacity(limit.min(64));
+    while batch.len() < limit {
+        match commands.try_recv() {
+            Ok(command) => batch.push(command),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => return (batch, true),
+        }
+    }
+    (batch, false)
+}
+
+/// Elapsed microseconds since `started`, saturating instead of wrapping.
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 fn verbose_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -228,6 +252,11 @@ const UDP_RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // 250 us matches the core input poll floor so the whole client-side input
 // chain stays bounded below one millisecond.
 const CONTROL_RECEIVE_POLL_INTERVAL: Duration = Duration::from_micros(250);
+/// Upper bound on commands taken in one drain pass. A large input burst
+/// (key repeat, paste, motion storm) must not monopolize the receive worker:
+/// leftovers stay queued and are taken at the next interleave point (loop
+/// top, between str0m outputs, after the flush).
+const INPUT_DRAIN_BATCH: usize = 32;
 const STUN_HEADER_LEN: usize = 20;
 const STUN_MAGIC_COOKIE: u32 = 0x2112_a442;
 const STUN_BINDING_REQUEST: u16 = 0x0001;
@@ -6036,145 +6065,166 @@ fn run_nvst_webrtc_bundle(
     let mut control_keepalive_at = next_control_keepalive(Instant::now());
     let mut input_timeout_reported = false;
     let mut audio_receiver = NvstAudioReceiver::default();
-    'bundle: loop {
-        let now = Instant::now();
-        loop {
-            match commands.try_recv() {
-                Ok(UdpReceiverCommand::Pause) => forward_optional(&event_sender, receiver.pause()),
-                Ok(UdpReceiverCommand::Resume) => {
-                    forward_optional(&event_sender, receiver.resume())
-                }
-                Ok(UdpReceiverCommand::Recover) => {
-                    forward_optional(&event_sender, receiver.recover())
-                }
-                Ok(UdpReceiverCommand::SendText { text, timestamp_us }) => {
-                    if !text.is_cancelled()
-                        && input_state.is_ready()
-                        && let Some(channels) = input_channels
-                        && !channels.send_text(&mut rtc, &text, timestamp_us)
-                    {
-                        eprintln!("NVST text submission rejected by reliable channel");
+    // Bounded input drain: at most INPUT_DRAIN_BATCH commands per pass so a
+    // large input burst cannot monopolize the receive worker between video
+    // packets; leftovers stay queued for the next interleave point (loop top,
+    // between str0m outputs, after the flush). Stop and a closed channel still
+    // shut the worker down after honoring at most one bounded batch.
+    macro_rules! drain_input_commands {
+            ($exit:lifetime) => {{
+                let (batch, disconnected) = take_command_batch(&commands, INPUT_DRAIN_BATCH);
+                let mut stop = disconnected;
+                for command in batch {
+                    match command {
+                    UdpReceiverCommand::Pause => forward_optional(&event_sender, receiver.pause()),
+                    UdpReceiverCommand::Resume => {
+                        forward_optional(&event_sender, receiver.resume())
                     }
-                }
-                Ok(UdpReceiverCommand::SendInput {
-                    bytes,
-                    origin,
-                    queued_at,
-                    reply,
-                }) => {
-                    let dequeued_at = Instant::now();
-                    if let Some(diagnostics) = &mut input_diagnostics
-                        && let Some(queued_at) = queued_at
-                    {
-                        diagnostics.input(origin, queued_at, dequeued_at);
+                    UdpReceiverCommand::Recover => {
+                        forward_optional(&event_sender, receiver.recover())
                     }
-                    if input_state.is_ready()
-                        && let Some(channels) = input_channels
-                    {
-                        let input_types = native_input_types(&bytes);
-                        let should_log = verbose_diagnostics_enabled()
-                            && match input_types.as_ref() {
-                                Ok(types) => {
-                                    let only_motion = !types.is_empty()
-                                        && types.iter().all(|input_type| {
-                                            native_input_type_is_motion(*input_type)
-                                        });
-                                    if only_motion {
-                                        mouse_motion_packets = mouse_motion_packets.wrapping_add(1);
+                    UdpReceiverCommand::SendText { text, timestamp_us } => {
+                        if !text.is_cancelled()
+                            && input_state.is_ready()
+                            && let Some(channels) = input_channels
+                            && !channels.send_text(&mut rtc, &text, timestamp_us)
+                        {
+                            eprintln!("NVST text submission rejected by reliable channel");
+                        }
+                    }
+                    UdpReceiverCommand::SendInput {
+                        bytes,
+                        origin,
+                        queued_at,
+                        reply,
+                    } => {
+                        let dequeued_at = Instant::now();
+                        if let Some(diagnostics) = &mut input_diagnostics
+                            && let Some(queued_at) = queued_at
+                        {
+                            diagnostics.input(origin, queued_at, dequeued_at);
+                        }
+                        if input_state.is_ready()
+                            && let Some(channels) = input_channels
+                        {
+                            let input_types = native_input_types(&bytes);
+                            let should_log = verbose_diagnostics_enabled()
+                                && match input_types.as_ref() {
+                                    Ok(types) => {
+                                        let only_motion = !types.is_empty()
+                                            && types.iter().all(|input_type| {
+                                                native_input_type_is_motion(*input_type)
+                                            });
+                                        if only_motion {
+                                            mouse_motion_packets = mouse_motion_packets.wrapping_add(1);
+                                        }
+                                        let changed = *types != last_input_types;
+                                        if changed {
+                                            last_input_types.clone_from(types);
+                                        }
+                                        changed || !only_motion || mouse_motion_packets % 120 == 1
                                     }
-                                    let changed = *types != last_input_types;
-                                    if changed {
-                                        last_input_types.clone_from(types);
+                                    Err(_) => true,
+                                };
+                            if should_log {
+                                match input_types.as_ref() {
+                                    Ok(types) => {
+                                        let names = types
+                                            .iter()
+                                            .map(|input_type| {
+                                                format!(
+                                                    "{}({input_type})",
+                                                    native_input_type_name(*input_type)
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(",");
+                                        eprintln!(
+                                            "NVST native input rx: events=[{names}] bytes={} raw={}",
+                                            bytes.len(),
+                                            diagnostic_hex(&bytes, 128),
+                                        );
                                     }
-                                    changed || !only_motion || mouse_motion_packets % 120 == 1
-                                }
-                                Err(_) => true,
-                            };
-                        if should_log {
-                            match input_types.as_ref() {
-                                Ok(types) => {
-                                    let names = types
-                                        .iter()
-                                        .map(|input_type| {
-                                            format!(
-                                                "{}({input_type})",
-                                                native_input_type_name(*input_type)
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(",");
-                                    eprintln!(
-                                        "NVST native input rx: events=[{names}] bytes={} raw={}",
+                                    Err(error) => eprintln!(
+                                        "NVST native input rx undecodable: error={error} bytes={} raw={}",
                                         bytes.len(),
                                         diagnostic_hex(&bytes, 128),
-                                    );
+                                    ),
                                 }
-                                Err(error) => eprintln!(
-                                    "NVST native input rx undecodable: error={error} bytes={} raw={}",
-                                    bytes.len(),
-                                    diagnostic_hex(&bytes, 128),
-                                ),
                             }
+                            let timestamp_us = transport_origin
+                                .elapsed()
+                                .as_micros()
+                                .try_into()
+                                .unwrap_or(u64::MAX);
+                            if !send_nvst_captured_input(
+                                &mut input_codec,
+                                &bytes,
+                                timestamp_us,
+                                reply,
+                                &input_ready,
+                                &event_sender,
+                                |message| {
+                                    if should_log {
+                                        eprintln!(
+                                            "NVST encoded input tx: route={:?} bytes={} raw={}",
+                                            message.route,
+                                            message.bytes.len(),
+                                            diagnostic_hex(&message.bytes, 128),
+                                        );
+                                    }
+                                    channels.send_encoded(&mut rtc, message)
+                                },
+                            ) {
+                                rtc.disconnect();
+                                forward_optional(&event_sender, receiver.stop());
+                                break $exit;
+                            }
+                        } else if let Some(reply) = reply {
+                            let _ = reply.send(Err(TransportError::InputNotReady));
                         }
-                        let timestamp_us = transport_origin
-                            .elapsed()
-                            .as_micros()
-                            .try_into()
-                            .unwrap_or(u64::MAX);
-                        if !send_nvst_captured_input(
-                            &mut input_codec,
-                            &bytes,
-                            timestamp_us,
-                            reply,
-                            &input_ready,
-                            &event_sender,
-                            |message| {
-                                if should_log {
-                                    eprintln!(
-                                        "NVST encoded input tx: route={:?} bytes={} raw={}",
-                                        message.route,
-                                        message.bytes.len(),
-                                        diagnostic_hex(&message.bytes, 128),
-                                    );
-                                }
-                                channels.send_encoded(&mut rtc, message)
-                            },
-                        ) {
-                            rtc.disconnect();
-                            forward_optional(&event_sender, receiver.stop());
-                            break 'bundle;
+                    }
+                        UdpReceiverCommand::Stop => {
+                            stop = true;
+                            break;
                         }
-                    } else if let Some(reply) = reply {
-                        let _ = reply.send(Err(TransportError::InputNotReady));
                     }
                 }
-                Ok(UdpReceiverCommand::Stop) | Err(TryRecvError::Disconnected) => {
-                    if let (Some(_), Some(hid_session), Some(channels)) =
-                        (hid_runtime.as_ref(), hid_session.as_mut(), input_channels)
-                    {
-                        queue_hid_shutdown(hid_session, channels, &mut rtc);
-                        forward_rtc_outputs(
-                            &mut rtc,
-                            |output| {
-                                if let Output::Transmit(transmit) = output {
-                                    let _ = socket.send_to(&transmit.contents, bundle_peer);
-                                }
-                            },
-                            SONY_SHUTDOWN_FLUSH_BUDGET,
-                        );
-                    }
-                    if let Some(hid_runtime) = hid_runtime.as_ref()
-                        && let Some(generation) = hid_runtime.session_generation()
-                    {
-                        hid_runtime.unbind_session(generation);
-                    }
-                    rtc.disconnect();
-                    forward_optional(&event_sender, receiver.stop());
-                    break 'bundle;
+                if stop {
+                        if let (Some(_), Some(hid_session), Some(channels)) =
+                            (hid_runtime.as_ref(), hid_session.as_mut(), input_channels)
+                        {
+                            queue_hid_shutdown(hid_session, channels, &mut rtc);
+                            forward_rtc_outputs(
+                                &mut rtc,
+                                |output| {
+                                    if let Output::Transmit(transmit) = output {
+                                        let _ = socket.send_to(&transmit.contents, bundle_peer);
+                                    }
+                                },
+                                SONY_SHUTDOWN_FLUSH_BUDGET,
+                            );
+                        }
+                        if let Some(hid_runtime) = hid_runtime.as_ref()
+                            && let Some(generation) = hid_runtime.session_generation()
+                        {
+                            hid_runtime.unbind_session(generation);
+                        }
+                        rtc.disconnect();
+                        forward_optional(&event_sender, receiver.stop());
+                        break $exit;
                 }
-                Err(TryRecvError::Empty) => break,
-            }
+            }};
         }
+
+    let mut last_drain_exit = Instant::now();
+    'bundle: loop {
+        let now = Instant::now();
+        if let Some(diagnostics) = &mut input_diagnostics {
+            diagnostics.record_worker_iteration(elapsed_us(last_drain_exit));
+        }
+        drain_input_commands!('bundle);
+        last_drain_exit = Instant::now();
 
         // Official first burst is three ICE Binding Requests, plus NATT
         // ping-string PING. After DTLS they keep pinging at 100ms.
@@ -6463,7 +6513,12 @@ fn run_nvst_webrtc_bundle(
                 microphone_sequence += 1;
             }
         }
+        if let Some(diagnostics) = &mut input_diagnostics {
+            diagnostics.note_other(elapsed_us(last_drain_exit));
+        }
+        let poll_started = Instant::now();
         let timeout = loop {
+            drain_input_commands!('bundle);
             match rtc.poll_output() {
                 Ok(Output::Timeout(timeout)) => break timeout,
                 Ok(Output::Transmit(transmit)) => {
@@ -6810,12 +6865,20 @@ fn run_nvst_webrtc_bundle(
             }
         };
 
+        if let Some(diagnostics) = &mut input_diagnostics {
+            diagnostics.note_poll_out(elapsed_us(poll_started));
+        }
         // Every input written this iteration has now been packetized by str0m
         // and handed to the UDP socket inside the poll_output drain above.
+        let flush_started = Instant::now();
         if let Some(diagnostics) = &mut input_diagnostics {
             diagnostics.flush(Instant::now());
+            diagnostics.note_flush(elapsed_us(flush_started));
         }
+
+        drain_input_commands!('bundle);
         drop(microphone_queue);
+        let recv_started = Instant::now();
         let wait = timeout
             .saturating_duration_since(Instant::now())
             .min(CONTROL_RECEIVE_POLL_INTERVAL);
@@ -6863,6 +6926,9 @@ fn run_nvst_webrtc_bundle(
                             received_at,
                         ) {
                             feedback.publish_ping(false, received_at, elapsed);
+                            if let Some(diagnostics) = &mut input_diagnostics {
+                                diagnostics.record_control_rtt(elapsed);
+                            }
                         }
                     }
                     if datagram[..length] == *b"PING" {
@@ -6932,6 +6998,9 @@ fn run_nvst_webrtc_bundle(
             }
         }
 
+        if let Some(diagnostics) = &mut input_diagnostics {
+            diagnostics.note_recv(elapsed_us(recv_started));
+        }
         let timeout = if owns_media_timeout {
             receiver.poll_timeout(Instant::now())
         } else {
@@ -7454,6 +7523,31 @@ mod tests {
         include!("nvst_nack_tests.rs");
     }
     use super::*;
+
+    /// The bounded drain batch: at most `INPUT_DRAIN_BATCH` commands per
+    /// pass (a large input burst must not monopolize the worker between
+    /// video packets), and a closed channel is reported even when it still
+    /// had queued commands.
+    #[test]
+    fn command_batch_is_bounded_and_flags_disconnect() {
+        let (tx, rx) = std::sync::mpsc::channel::<UdpReceiverCommand>();
+        for _ in 0..(INPUT_DRAIN_BATCH + 10) {
+            tx.send(UdpReceiverCommand::Pause).expect("queue open");
+        }
+        let (batch, disconnected) = take_command_batch(&rx, INPUT_DRAIN_BATCH);
+        assert_eq!(batch.len(), INPUT_DRAIN_BATCH);
+        assert!(!disconnected);
+        let (rest, disconnected) = take_command_batch(&rx, INPUT_DRAIN_BATCH);
+        assert_eq!(rest.len(), 10, "leftovers stay queued for the next pass");
+        assert!(!disconnected);
+        let (empty, disconnected) = take_command_batch(&rx, INPUT_DRAIN_BATCH);
+        assert!(empty.is_empty());
+        assert!(!disconnected);
+        drop(tx);
+        let (empty, disconnected) = take_command_batch(&rx, INPUT_DRAIN_BATCH);
+        assert!(empty.is_empty());
+        assert!(disconnected, "an empty closed channel reports the close");
+    }
     use serde_json::json;
 
     const TEST_KEY: &str = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
