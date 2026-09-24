@@ -430,7 +430,7 @@ FocusScope {
             font.pixelSize: DesktopTokens.bodySize
             leftPadding: 42
             DesktopGlyph { x: 16; anchors.verticalCenter: parent.verticalCenter; width: 16; height: 16; icon: "desktop-search.svg" }
-            background: Rectangle { radius: 10; color: Theme.glass; border.width: 1; border.color: settingsSearch.activeFocus ? Theme.focus : Theme.seam }
+            background: Rectangle { radius: 14; color: Theme.glass; border.width: settingsSearch.activeFocus ? 2 : 1; border.color: settingsSearch.activeFocus ? Theme.focus : Theme.seam }
             onAccepted: {
                 for (let i = 0; i < root.sections.length; ++i) {
                     if (root.matchesSection(root.sections[i])) {
@@ -467,9 +467,10 @@ FocusScope {
                         onClicked: root.selectedSection = modelData.page
                         background: Rectangle {
                             radius: 16
-                            color: root.selectedGroup === index ? DesktopTokens.raisedStrong : parent.hovered ? DesktopTokens.raised : "transparent"
+                            color: root.selectedGroup === index ? Qt.rgba(Theme.focus.r, Theme.focus.g, Theme.focus.b, 0.12) : parent.hovered ? DesktopTokens.raised : "transparent"
                             border.width: parent.activeFocus ? 2 : 0
                             border.color: Theme.focus
+                            Behavior on color { ColorAnimation { duration: DesktopTokens.quickDuration } }
                         }
                         contentItem: RowLayout {
                             spacing: 14

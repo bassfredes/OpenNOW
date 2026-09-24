@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Effects
+import QtQuick.Shapes
 import OpenNOW
 
 Item {
@@ -118,7 +119,7 @@ Item {
 
         Text {
             text: root.slide && root.slide.kind === "marketing" ? qsTr("GEFORCE NOW") : qsTr("FEATURED")
-            color: DesktopTokens.mint
+            color: DesktopTokens.focus
             font.family: Theme.monoFont
             font.pixelSize: DesktopTokens.microSize
             font.weight: Font.Bold
@@ -130,9 +131,9 @@ Item {
             text: root.slide ? String(root.slide.title || "") : ""
             color: "#FFFFFF"
             font.family: Theme.displayFont
-            font.pixelSize: DesktopTokens.px(30)
+            font.pixelSize: DesktopTokens.px(34)
             font.weight: Font.Black
-            font.letterSpacing: -0.9
+            font.letterSpacing: -1.1
             elide: Text.ElideRight
             maximumLineCount: 2
             wrapMode: Text.WordWrap
@@ -156,15 +157,16 @@ Item {
 
     Row {
         x: 24
-        y: parent.height - 58
-        height: 36
-        spacing: 9
+        y: parent.height - 68
+        height: 44
+        spacing: 10
         visible: root.slideGame !== null
 
         Button {
             id: playButton
-            width: 121
-            height: 36
+            readonly property color ink: Theme.focusText
+            width: 128
+            height: 44
             padding: 0
             focusPolicy: Qt.NoFocus
             hoverEnabled: true
@@ -173,26 +175,84 @@ Item {
             onHoveredChanged: if (hovered) root.actionPointed(0)
             onClicked: if (root.slideGame) root.playRequested(root.slideGame)
             background: Rectangle {
-                radius: 10
-                color: playButton.down ? Qt.rgba(1, 1, 1, 0.82) : Qt.rgba(1, 1, 1, 0.95)
-                border.width: root.selectedAction === 0 ? 2 : 0
-                border.color: DesktopTokens.focus
+                radius: 14
+                color: Theme.focus
+                scale: playButton.down && !AppController.reducedMotion ? 0.98 : 1
+                Behavior on scale { NumberAnimation { duration: DesktopTokens.quickDuration; easing.type: Easing.OutCubic } }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: parent.radius
+                    color: "#FFFFFF"
+                    opacity: playButton.hovered ? 0.16 : 0
+                    Behavior on opacity { NumberAnimation { duration: DesktopTokens.quickDuration } }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    anchors.margins: 1
+                    radius: parent.radius - 1
+                    color: "transparent"
+                    border.width: 1
+                    border.color: "#38FFFFFF"
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    anchors.margins: -3
+                    radius: parent.radius + 3
+                    color: "transparent"
+                    border.width: 2
+                    border.color: "#FFFFFF"
+                    visible: root.selectedAction === 0
+                }
             }
-            contentItem: Text {
-                text: playButton.text
-                color: "#0B0F1A"
-                font.family: Theme.bodyFont
-                font.pixelSize: DesktopTokens.captionSize
-                font.weight: Font.ExtraBold
-                horizontalAlignment: Text.AlignHCenter
-                verticalAlignment: Text.AlignVCenter
+            contentItem: Row {
+                spacing: 10
+                anchors.centerIn: parent
+                Item {
+                    width: 26
+                    height: 26
+                    anchors.verticalCenter: parent.verticalCenter
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: width / 2
+                        color: Qt.rgba(playButton.ink.r, playButton.ink.g, playButton.ink.b, 0.14)
+                    }
+                    // Nudged right of centre: a centred triangle reads left-heavy.
+                    Shape {
+                        anchors.centerIn: parent
+                        anchors.horizontalCenterOffset: 1
+                        width: 9
+                        height: 11
+                        layer.enabled: true
+                        layer.samples: 4
+                        ShapePath {
+                            fillColor: playButton.ink
+                            strokeColor: playButton.ink
+                            strokeWidth: 1.5
+                            joinStyle: ShapePath.RoundJoin
+                            startX: 0.75
+                            startY: 0.75
+                            PathLine { x: 8.25; y: 5.5 }
+                            PathLine { x: 0.75; y: 10.25 }
+                            PathLine { x: 0.75; y: 0.75 }
+                        }
+                    }
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: playButton.text
+                    color: playButton.ink
+                    font.family: Theme.displayFont
+                    font.pixelSize: DesktopTokens.bodySize
+                    font.weight: Font.Black
+                }
             }
         }
 
         Button {
             id: detailsButton
-            width: 153
-            height: 36
+            anchors.verticalCenter: parent.verticalCenter
+            width: 132
+            height: 40
             padding: 0
             focusPolicy: Qt.NoFocus
             hoverEnabled: true
@@ -201,10 +261,11 @@ Item {
             onHoveredChanged: if (hovered) root.actionPointed(1)
             onClicked: if (root.slideGame) root.detailsRequested(root.slideGame)
             background: Rectangle {
-                radius: 10
-                color: detailsButton.down ? Qt.rgba(1, 1, 1, 0.16) : Qt.rgba(1, 1, 1, 0.10)
-                border.width: root.selectedAction === 1 ? 2 : 1
-                border.color: root.selectedAction === 1 ? DesktopTokens.focus : Qt.rgba(1, 1, 1, 0.18)
+                radius: 12
+                color: detailsButton.down ? Qt.rgba(1, 1, 1, 0.16) : detailsButton.hovered ? Qt.rgba(1, 1, 1, 0.12) : Qt.rgba(1, 1, 1, 0.06)
+                border.width: root.selectedAction === 1 ? 2 : 0
+                border.color: "#FFFFFF"
+                Behavior on color { ColorAnimation { duration: DesktopTokens.quickDuration } }
             }
             contentItem: Text {
                 text: detailsButton.text
@@ -230,7 +291,7 @@ Item {
                 width: index === root.currentSlide ? 18 : 6
                 height: 6
                 radius: 3
-                color: index === root.currentSlide ? DesktopTokens.mint : Qt.rgba(1, 1, 1, 0.28)
+                color: index === root.currentSlide ? DesktopTokens.focus : Qt.rgba(1, 1, 1, 0.28)
                 Behavior on width { NumberAnimation { duration: AppController.reducedMotion ? 0 : 180; easing.type: Easing.OutCubic } }
                 HoverHandler { cursorShape: Qt.PointingHandCursor }
                 TapHandler { onTapped: root.currentSlide = index }

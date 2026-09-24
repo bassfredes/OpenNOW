@@ -7,6 +7,8 @@ ItemDelegate {
     property var game: null
     property bool showTitle: false
     property bool showPlay: false
+    // Variant: no idle outline, accent play control on hover.
+    property bool refined: false
     property bool selected: activeFocus
     property int tileWidth: DesktopTokens.libraryCellWidth
     property int tileHeight: showTitle ? DesktopTokens.px(248) : DesktopTokens.libraryCellHeight
@@ -44,7 +46,7 @@ ItemDelegate {
             height: art.height + DesktopTokens.cardOutlinePad * 2
             radius: 14
             color: "transparent"
-            border.width: root.cardLifted ? 2 : 1
+            border.width: root.cardLifted ? 2 : (root.refined ? 0 : 1)
             border.color: root.cardLifted ? DesktopTokens.focus : DesktopTokens.cardOutlineIdle
             Behavior on border.color {
                 ColorAnimation { duration: Theme.focusDuration }
@@ -56,6 +58,7 @@ ItemDelegate {
             anchors.bottomMargin: 12
             width: root.artWidth - 18
             game: root.game
+            refined: root.refined
             visible: root.cardLifted && !root.showTitle
         }
         Column {

@@ -23,7 +23,7 @@ FocusScope {
     readonly property color mutedInk: Theme.lightMode ? Theme.textMuted : "#8AFFFFFF"
     readonly property color faintInk: Theme.lightMode ? Theme.textMuted : "#6BFFFFFF"
     readonly property color bodyInk: Theme.lightMode ? Theme.textMuted : "#A3FFFFFF"
-    readonly property color mint: "#6EE7B7"
+    readonly property color accent: Theme.focus
     readonly property color cardSeam: Theme.lightMode ? Theme.seam : "#24FFFFFF"
     readonly property bool hasExpiry: challenge !== null && Number.isFinite(Number(challenge.expiresAt))
     readonly property int secondsLeft: hasExpiry ? Math.max(0, Math.ceil((Number(challenge.expiresAt) - clockMs) / 1000)) : 0
@@ -83,11 +83,10 @@ FocusScope {
 
     component AuthButton: DesktopButton {
         id: action
-        property bool quiet: false
         property bool external: false
         height: DesktopTokens.px(44)
         implicitWidth: Math.max(DesktopTokens.px(68), contentItem.implicitWidth + leftPadding + rightPadding)
-        cornerRadius: DesktopTokens.px(10)
+        cornerRadius: DesktopTokens.px(14)
         font.pixelSize: DesktopTokens.px(13)
         contentItem: Item {
             implicitWidth: actionContents.implicitWidth
@@ -97,24 +96,42 @@ FocusScope {
                 anchors.centerIn: parent
                 spacing: DesktopTokens.px(10)
                 DesktopGlyph { visible: action.glyph !== ""; anchors.verticalCenter: parent.verticalCenter; width: action.glyphSize; height: action.glyphSize; icon: action.glyph }
-                BodyText { anchors.verticalCenter: parent.verticalCenter; text: action.text; color: action.primary ? "#0B0F1A" : action.quiet ? root.bodyInk : DesktopTokens.text; font: action.font }
-                BodyText { visible: action.external; anchors.verticalCenter: parent.verticalCenter; text: "↗"; color: action.primary ? "#0B0F1A" : DesktopTokens.text; font: action.font }
+                BodyText { anchors.verticalCenter: parent.verticalCenter; text: action.text; color: action.primary ? Theme.focusText : action.quiet ? root.bodyInk : DesktopTokens.text; font: action.font }
+                BodyText { visible: action.external; anchors.verticalCenter: parent.verticalCenter; text: "↗"; color: action.primary ? Theme.focusText : DesktopTokens.text; font: action.font }
             }
         }
         background: Rectangle {
             radius: action.cornerRadius
-            color: action.primary ? (action.down ? Qt.darker(root.mint, 1.1) : root.mint)
+            color: action.primary ? root.accent
                 : action.hovered || action.activeFocus ? DesktopTokens.raised : "transparent"
-            border.width: action.activeFocus ? 2 : action.primary || action.quiet ? 0 : 1
-            border.color: action.activeFocus ? DesktopTokens.focus : root.cardSeam
+            border.width: action.primary || action.quiet ? 0 : 1
+            border.color: root.cardSeam
             opacity: action.enabled ? 1 : 0.5
+            scale: action.down && !AppController.reducedMotion ? 0.98 : 1
+            Behavior on scale { NumberAnimation { duration: DesktopTokens.quickDuration; easing.type: Easing.OutCubic } }
             layer.enabled: action.primary
             layer.effect: MultiEffect {
                 shadowEnabled: true
-                shadowColor: "#2E6EE7B7"
+                shadowColor: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22)
                 shadowBlur: 0.6
                 shadowVerticalOffset: DesktopTokens.px(8)
                 shadowHorizontalOffset: 0
+            }
+            Rectangle {
+                anchors.fill: parent; radius: parent.radius
+                color: "#FFFFFF"
+                opacity: action.primary && action.hovered ? 0.14 : 0
+                Behavior on opacity { NumberAnimation { duration: DesktopTokens.quickDuration } }
+            }
+            Rectangle {
+                anchors.fill: parent; anchors.margins: 1; radius: parent.radius - 1
+                color: "transparent"; border.width: 1; border.color: "#38FFFFFF"
+                visible: action.primary
+            }
+            Rectangle {
+                anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3
+                color: "transparent"; border.width: 2; border.color: DesktopTokens.focus
+                visible: action.activeFocus
             }
         }
     }
@@ -173,30 +190,16 @@ FocusScope {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: DesktopTokens.px(6)
                 leftPadding: DesktopTokens.px(4)
-                Rectangle {
-                    width: versionLabel.implicitWidth + DesktopTokens.px(16)
-                    height: DesktopTokens.px(24)
-                    radius: DesktopTokens.px(6)
-                    color: DesktopTokens.seamSoft
-                    border.width: 1
-                    border.color: DesktopTokens.seamSoft
-                    MonoText {
-                        id: versionLabel
-                        anchors.centerIn: parent
-                        text: Qt.application.version || qsTr("unknown")
-                        color: root.bodyInk
-                        font.pixelSize: DesktopTokens.px(11)
-                        font.letterSpacing: 0
-                        lineHeight: DesktopTokens.px(14)
-                    }
+                MonoText {
+                    id: versionLabel
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: Qt.application.version || qsTr("unknown")
+                    color: root.bodyInk
+                    font.pixelSize: DesktopTokens.px(11)
+                    font.letterSpacing: 0
+                    lineHeight: DesktopTokens.px(14)
                 }
-                Rectangle {
-                    width: betaLabel.implicitWidth + DesktopTokens.px(14)
-                    height: DesktopTokens.px(24)
-                    radius: DesktopTokens.px(6)
-                    color: "#1FFFD166"
-                    MonoText { id: betaLabel; anchors.centerIn: parent; text: qsTr("BETA"); color: Theme.accentColor("amber") }
-                }
+                MonoText { id: betaLabel; anchors.verticalCenter: parent.verticalCenter; text: qsTr("BETA"); color: Theme.accentColor("amber") }
             }
         }
         Row {
@@ -430,10 +433,10 @@ FocusScope {
                                 width: DesktopTokens.px(44)
                                 height: DesktopTokens.px(26)
                                 radius: height / 2
-                                color: root.staySignedIn ? root.mint : DesktopTokens.raisedStrong
+                                color: root.staySignedIn ? root.accent : DesktopTokens.raisedStrong
                                 border.width: persistenceButton.activeFocus ? 2 : 0
                                 border.color: DesktopTokens.focus
-                                Rectangle { x: root.staySignedIn ? parent.width - width - DesktopTokens.px(3) : DesktopTokens.px(3); y: DesktopTokens.px(3); width: DesktopTokens.px(20); height: width; radius: width / 2; color: root.staySignedIn ? "#0B0F1A" : DesktopTokens.text }
+                                Rectangle { x: root.staySignedIn ? parent.width - width - DesktopTokens.px(3) : DesktopTokens.px(3); y: DesktopTokens.px(3); width: DesktopTokens.px(20); height: width; radius: width / 2; color: root.staySignedIn ? Theme.focusText : DesktopTokens.text }
                             }
                         }
                         onClicked: root.staySignedIn = !root.staySignedIn
@@ -447,10 +450,12 @@ FocusScope {
                         visible: !root.waiting && !root.failed
                         AuthButton {
                             width: parent.width
-                            height: DesktopTokens.px(48)
+                            height: DesktopTokens.px(56)
                             primary: true
                             external: true
-                            font.pixelSize: DesktopTokens.px(14)
+                            cornerRadius: DesktopTokens.px(16)
+                            font.pixelSize: DesktopTokens.px(15)
+                            font.weight: Font.Black
                             text: qsTr("Continue with %1").arg(root.selectedProvider.displayName)
                             enabled: ShellStore.ready && ShellStore.selectedProvider !== null
                             onClicked: ShellStore.startDeviceLogin(root.selectedProvider.idpId || "", root.staySignedIn)

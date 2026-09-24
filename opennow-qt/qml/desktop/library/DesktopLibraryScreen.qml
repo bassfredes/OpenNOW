@@ -1,5 +1,6 @@
 pragma ComponentBehavior: Bound
 import QtQuick
+import QtQuick.Shapes
 import QtQuick.Controls
 import OpenNOW
 
@@ -139,26 +140,30 @@ FocusScope {
             elide: Text.ElideRight
             verticalAlignment: Text.AlignVCenter
             color: DesktopTokens.text
-            font.family: DesktopTokens.bodyFont
-            font.pixelSize: 18
-            font.bold: true
+            font.family: DesktopTokens.displayFont
+            font.pixelSize: DesktopTokens.titleSize
+            font.weight: Font.Black
+            font.letterSpacing: -0.6
         }
         Row {
             id: collectionActions
             spacing: 8
             DesktopButton {
                 text: qsTr("All games")
+                quiet: true
                 visible: root.collection !== null
                 onClicked: ShellStore.activeCollectionId = ""
             }
             DesktopButton {
                 text: qsTr("Rename")
+                quiet: true
                 visible: root.collection !== null
                 enabled: !ShellStore.collectionsBusy
                 onClicked: root.editCollection("rename", null)
             }
             DesktopButton {
                 text: qsTr("Delete")
+                quiet: true
                 visible: root.collection !== null
                 enabled: !ShellStore.collectionsBusy
                 onClicked: root.editCollection("delete", null)
@@ -180,12 +185,15 @@ FocusScope {
         width: parent.width - 48
         height: visible ? Math.max(58, noticeText.implicitHeight + 24) : 0
         visible: root.activeFilter === "cloud-favorites" || (ShellStore.catalogSource === "account-library" && ShellStore.catalogState !== "ready")
-        radius: 10
-        color: DesktopTokens.surface
-        border.color: DesktopTokens.seam
+        radius: 12
+        color: DesktopTokens.raised
+        Rectangle {
+            x: 0; y: 10; width: 3; height: parent.height - 20; radius: 1.5
+            color: ShellStore.catalogError !== "" ? DesktopTokens.danger : DesktopTokens.focus
+        }
         Text {
             id: noticeText
-            x: 14; y: 12; width: parent.width - noticeAction.width - 42
+            x: 18; y: 12; width: parent.width - noticeAction.width - 46
             text: root.activeFilter === "cloud-favorites" ? (ShellStore.remoteFavoritesError || qsTr("GeForce NOW favorites may show only part of your favorites. Refresh to check for updates. Home pins are separate.")) : ShellStore.catalogError || (ShellStore.catalogComplete
                 ? qsTr("Refreshing the library. Your last complete library is still shown.")
                 : qsTr("Loading your library. The games shown so far are only part of it."))
@@ -238,10 +246,18 @@ FocusScope {
                 hoverEnabled: true
                 clip: false
                 background: Rectangle {
-                    radius: 11
-                    color: root.activeFilter === filterButton.modelData.key ? "#1AFFFFFF" : (filterButton.hovered ? "#0FFFFFFF" : "transparent")
-                    border.width: 1
-                    border.color: root.activeFilter === filterButton.modelData.key ? "#3DFFFFFF" : DesktopTokens.seam
+                    radius: 12
+                    color: root.activeFilter === filterButton.modelData.key
+                        ? Qt.rgba(DesktopTokens.focus.r, DesktopTokens.focus.g, DesktopTokens.focus.b, 0.16)
+                        : (filterButton.hovered || filterButton.activeFocus ? DesktopTokens.raised : "transparent")
+                    border.width: root.activeFilter === filterButton.modelData.key ? 1 : 0
+                    border.color: DesktopTokens.focus
+                    Behavior on color { ColorAnimation { duration: DesktopTokens.quickDuration } }
+                    Rectangle {
+                        anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3
+                        color: "transparent"; border.width: 2; border.color: DesktopTokens.focus
+                        visible: filterButton.activeFocus && !(root.activeFilter === filterButton.modelData.key)
+                    }
                 }
                 contentItem: Item {
                     implicitWidth: chipRow.implicitWidth
@@ -265,7 +281,7 @@ FocusScope {
                             color: root.activeFilter === filterButton.modelData.key ? DesktopTokens.text : DesktopTokens.textMuted
                             font.family: DesktopTokens.bodyFont
                             font.pixelSize: 14
-                            font.weight: Font.Bold
+                            font.weight: root.activeFilter === filterButton.modelData.key ? Font.Bold : Font.DemiBold
                             verticalAlignment: Text.AlignVCenter
                         }
                         Text {
@@ -314,6 +330,7 @@ FocusScope {
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
         delegate: DesktopPoster {
             required property var modelData
+            refined: true
             game: modelData
             tileWidth: root.libraryCellW
             tileHeight: root.libraryCellH
@@ -343,9 +360,10 @@ FocusScope {
             width: parent.width
             text: root.collection ? qsTr("No games in this view") : qsTr("No games found")
             color: DesktopTokens.text
-            font.family: DesktopTokens.bodyFont
-            font.pixelSize: 22
-            font.bold: true
+            font.family: DesktopTokens.displayFont
+            font.pixelSize: DesktopTokens.titleSize
+            font.weight: Font.Black
+            font.letterSpacing: -0.4
             horizontalAlignment: Text.AlignHCenter
         }
         Text {
@@ -390,7 +408,7 @@ FocusScope {
     }
     Rectangle {
         x: root.contextPoint.x; y: root.contextPoint.y
-        width: 230; height: 286; radius: 12
+        width: 230; height: 290; radius: 14
         visible: contextMotion.present
         enabled: root.contextGame !== null
         z: 41
@@ -401,10 +419,24 @@ FocusScope {
             Text { width: parent.width; height: 26; leftPadding: 8; text: root.presentedContextGame ? String(root.presentedContextGame.title || "").toUpperCase() : ""; color: DesktopTokens.textFaint; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; font.family: DesktopTokens.monoFont; font.pixelSize: DesktopTokens.tinySize; font.weight: Font.DemiBold; font.letterSpacing: 0.6 }
             Rectangle {
                 id: playRow
-                width: parent.width; height: 36; radius: 9
-                color: playHover.hovered ? "#FFFFFF" : "#F2FFFFFF"
-                Text { x: 12; anchors.verticalCenter: parent.verticalCenter; text: "▶  " + qsTr("Play"); color: "#0B0F1A"; font.family: DesktopTokens.bodyFont; font.pixelSize: DesktopTokens.captionSize; font.weight: Font.Black }
-                KeyboardGlyph { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; shortcut: "Enter"; keySize: 20; ink: "#0B0F1A"; Accessible.name: qsTr("Enter") }
+                readonly property color ink: Theme.focusText
+                width: parent.width; height: 40; radius: 12
+                color: Theme.focus
+                Rectangle { anchors.fill: parent; radius: parent.radius; color: "#FFFFFF"; opacity: playHover.hovered ? 0.16 : 0; Behavior on opacity { NumberAnimation { duration: DesktopTokens.quickDuration } } }
+                Shape {
+                    x: 14; anchors.verticalCenter: parent.verticalCenter
+                    width: 9; height: 11
+                    layer.enabled: true; layer.samples: 4
+                    ShapePath {
+                        fillColor: playRow.ink; strokeColor: playRow.ink; strokeWidth: 1.5; joinStyle: ShapePath.RoundJoin
+                        startX: 0.75; startY: 0.75
+                        PathLine { x: 8.25; y: 5.5 }
+                        PathLine { x: 0.75; y: 10.25 }
+                        PathLine { x: 0.75; y: 0.75 }
+                    }
+                }
+                Text { x: 34; anchors.verticalCenter: parent.verticalCenter; text: qsTr("Play"); color: playRow.ink; font.family: DesktopTokens.bodyFont; font.pixelSize: DesktopTokens.captionSize; font.weight: Font.Black }
+                KeyboardGlyph { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; shortcut: "Enter"; keySize: 20; ink: playRow.ink; opacity: 0.8; Accessible.name: qsTr("Enter") }
                 HoverHandler { id: playHover; cursorShape: Qt.PointingHandCursor }
                 TapHandler { onTapped: root.activateContext("play") }
             }

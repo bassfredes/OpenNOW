@@ -12,7 +12,7 @@ Column {
     readonly property bool upscalingEnabled: settings.upscaling === (mac ? "metalfx" : "fsr1")
     readonly property bool mac: Qt.platform.os === "osx"
     readonly property bool wide: width >= DesktopTokens.px(1000)
-    readonly property color mint: Theme.accentColor("green")
+    readonly property color mint: Theme.focus
     readonly property color blue: Theme.accentColor("blue")
     readonly property color panelColor: Theme.lightMode ? Theme.glass : "#C70B0F1A"
     spacing: DesktopTokens.px(24)

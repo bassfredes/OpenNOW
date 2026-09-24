@@ -8,6 +8,7 @@ Column {
     property var game: ShellStore.selectedGame
     property bool showFavorites: true
     property bool showStatus: true
+    property bool quiet: false
     readonly property var variant: game && (game.variants || [])[Number(game.selectedVariantIndex || 0)]
     readonly property bool owned: Boolean(variant) && ["MANUAL", "PLATFORM_SYNC"].indexOf(variant.libraryStatus) >= 0
     spacing: DesktopTokens.px(8)
@@ -26,6 +27,7 @@ Column {
         width: parent.width
         spacing: DesktopTokens.px(8)
         DesktopButton {
+            quiet: root.quiet
             objectName: "cloudOwnershipAdd"
             visible: Boolean(root.variant) && root.variant.libraryStatus === "NOT_OWNED" && ShellStore.selectedLaunchDecision.status !== "ownership_required"
             enabled: ShellStore.signedIn && !ShellStore.cloudMutationBusy
@@ -33,6 +35,7 @@ Column {
             onClicked: ShellStore.requestOwnershipConfirmation("add")
         }
         DesktopButton {
+            quiet: root.quiet
             objectName: "cloudFavoriteAction"
             visible: root.showFavorites
             enabled: ShellStore.signedIn && !ShellStore.cloudMutationBusy
@@ -40,6 +43,7 @@ Column {
             onClicked: ShellStore.toggleCloudFavorite(root.game)
         }
         DesktopButton {
+            quiet: root.quiet
             objectName: "cloudOwnershipRemove"
             visible: root.owned
             enabled: !ShellStore.cloudMutationBusy
@@ -47,6 +51,7 @@ Column {
             onClicked: ShellStore.requestOwnershipConfirmation("remove")
         }
         DesktopButton {
+            quiet: root.quiet
             objectName: "cloudOwnershipSelect"
             visible: root.owned && root.variant.librarySelected !== true
             enabled: !ShellStore.cloudMutationBusy
@@ -54,12 +59,14 @@ Column {
             onClicked: ShellStore.selectPreferredVariant()
         }
         DesktopButton {
+            quiet: root.quiet
             objectName: "cloudLibraryRefresh"
             text: qsTr("Refresh status")
             enabled: ShellStore.signedIn && !ShellStore.cloudMutationBusy
             onClicked: ShellStore.refreshSelectedMetadata()
         }
         DesktopButton {
+            quiet: root.quiet
             text: qsTr("Game accounts")
             onClicked: AppController.navigate("game-accounts")
         }

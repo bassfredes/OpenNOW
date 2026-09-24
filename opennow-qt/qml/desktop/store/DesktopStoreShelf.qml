@@ -101,9 +101,9 @@ Item {
             text: root.title
             color: DesktopTokens.text
             font.family: Theme.displayFont
-            font.pixelSize: DesktopTokens.px(16)
+            font.pixelSize: DesktopTokens.px(18)
             font.weight: Font.Black
-            font.letterSpacing: -0.16
+            font.letterSpacing: -0.4
         }
 
         Text {
@@ -129,20 +129,25 @@ Item {
         Text {
             anchors.verticalCenter: parent.verticalCenter
             text: root.seeAllText
-            color: DesktopTokens.textMuted
+            color: seeAllHover.hovered ? DesktopTokens.focus : DesktopTokens.textMuted
             font.family: Theme.bodyFont
             font.pixelSize: DesktopTokens.smallSize
             font.weight: Font.Bold
+            Behavior on color { ColorAnimation { duration: DesktopTokens.quickDuration } }
         }
         Text {
             anchors.verticalCenter: parent.verticalCenter
+            // Arrow slides right on hover; transform only, no layout churn.
+            transform: Translate { x: seeAllHover.hovered && !AppController.reducedMotion ? 2 : 0; Behavior on x { NumberAnimation { duration: DesktopTokens.quickDuration; easing.type: Easing.OutCubic } } }
             text: "›"
-            color: DesktopTokens.textMuted
+            color: seeAllHover.hovered ? DesktopTokens.focus : DesktopTokens.textMuted
             font.family: Theme.bodyFont
             font.pixelSize: DesktopTokens.bodySize
             font.weight: Font.Bold
+            Behavior on color { ColorAnimation { duration: DesktopTokens.quickDuration } }
         }
 
+        HoverHandler { id: seeAllHover; cursorShape: Qt.PointingHandCursor }
         TapHandler { onTapped: root.seeAllRequested() }
     }
 

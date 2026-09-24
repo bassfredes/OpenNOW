@@ -11,7 +11,7 @@ Column {
     readonly property var settings: store.onboardingSettings
     readonly property string resolution: String(settings.resolution || "1920x1080")
     readonly property bool wide: width >= DesktopTokens.px(1000)
-    readonly property color mint: Theme.accentColor("green")
+    readonly property color mint: Theme.focus
     readonly property color panelColor: Theme.lightMode ? Theme.glass : "#C70B0F1A"
     spacing: DesktopTokens.px(24)
 

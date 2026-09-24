@@ -45,7 +45,7 @@ Item {
         height: root.tileHeight + DesktopTokens.cardOutlinePad * 2
         radius: 14
         color: "transparent"
-        border.width: root.highlighted ? 2 : 1
+        border.width: root.highlighted ? 2 : 0
         border.color: root.highlighted ? DesktopTokens.focus : DesktopTokens.cardOutlineIdle
 
         Behavior on border.color {
@@ -61,6 +61,7 @@ Item {
         anchors.rightMargin: 9
         anchors.bottomMargin: 12
         game: root.game
+        refined: true
         visible: root.highlighted
     }
 

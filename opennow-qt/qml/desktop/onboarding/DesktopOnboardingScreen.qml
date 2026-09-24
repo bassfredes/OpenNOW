@@ -15,7 +15,8 @@ FocusScope {
     readonly property string error: store.onboardingError
     readonly property var settings: store.onboardingSettings
     readonly property bool compact: width < DesktopTokens.px(960)
-    readonly property color mint: Theme.accentColor("green")
+    // The wizard follows the theme accent like the rest of the app (was a fixed green).
+    readonly property color mint: Theme.focus
     readonly property color amber: Theme.accentColor("amber")
     readonly property color coral: Theme.accentColor("coral")
     readonly property string displayName: store.authSession && store.authSession.user
@@ -165,9 +166,27 @@ FocusScope {
         background: Rectangle {
             radius: action.cornerRadius
             color: action.primary ? action.accent : action.hovered || action.down ? DesktopTokens.raisedStrong : DesktopTokens.seamSoft
-            border.width: action.activeFocus ? 2 : 1
-            border.color: action.activeFocus ? Theme.focus : action.primary ? action.accent : Theme.seam
+            border.width: action.primary ? 0 : 1
+            border.color: Theme.seam
+            scale: action.down && !AppController.reducedMotion ? 0.98 : 1
             Behavior on color { ColorAnimation { duration: DesktopTokens.quickDuration } }
+            Behavior on scale { NumberAnimation { duration: DesktopTokens.quickDuration; easing.type: Easing.OutCubic } }
+            Rectangle {
+                anchors.fill: parent; radius: parent.radius
+                color: "#FFFFFF"
+                opacity: action.primary && action.hovered ? 0.14 : 0
+                Behavior on opacity { NumberAnimation { duration: DesktopTokens.quickDuration } }
+            }
+            Rectangle {
+                anchors.fill: parent; anchors.margins: 1; radius: parent.radius - 1
+                color: "transparent"; border.width: 1; border.color: "#38FFFFFF"
+                visible: action.primary
+            }
+            Rectangle {
+                anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3
+                color: "transparent"; border.width: 2; border.color: Theme.focus
+                visible: action.activeFocus
+            }
         }
         contentItem: Text {
             id: actionLabel
@@ -189,12 +208,12 @@ FocusScope {
             width: keyText.implicitWidth + DesktopTokens.px(16)
             height: DesktopTokens.px(action.primary ? 32 : 22)
             radius: DesktopTokens.px(6)
-            color: action.primary ? "#0B0F1A" : DesktopTokens.raised
+            color: action.primary ? Qt.rgba(Theme.contrastText(action.accent).r, Theme.contrastText(action.accent).g, Theme.contrastText(action.accent).b, 0.14) : DesktopTokens.raised
             Text {
                 id: keyText
                 anchors.centerIn: parent
                 text: action.keyHint
-                color: action.primary ? action.accent : Theme.textMuted
+                color: action.primary ? Theme.contrastText(action.accent) : Theme.textMuted
                 font.family: Theme.monoFont; font.pixelSize: DesktopTokens.px(10)
                 font.weight: Font.Bold
             }

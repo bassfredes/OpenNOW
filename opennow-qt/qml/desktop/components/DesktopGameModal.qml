@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Shapes
 import QtQuick.Window
 import OpenNOW
 
@@ -38,24 +39,6 @@ FocusScope {
         if (!game)
             return false
         return ShellStore.selectedLaunchDecision.status === "ready"
-    }
-    readonly property bool hasRtx: {
-        const game = root.game
-        if (!game)
-            return false
-        const parts = [String(game.title || "")]
-        const lists = [game.genres, game.nvidiaTech, game.featureLabels]
-        for (let i = 0; i < lists.length; ++i) {
-            const list = lists[i] || []
-            for (let j = 0; j < list.length; ++j)
-                parts.push(String(list[j]))
-        }
-        const skuTags = game.catalogSkuStrings && game.catalogSkuStrings.SKU_BASED_TAG
-        if (skuTags) {
-            for (let k = 0; k < skuTags.length; ++k)
-                parts.push(String(skuTags[k]))
-        }
-        return parts.join(" ").toLowerCase().indexOf("rtx") >= 0
     }
     readonly property string lastPlayedText: {
         const game = root.game
@@ -126,65 +109,9 @@ FocusScope {
         const region = String(root.streamSettings.region || "")
         return region ? region.toUpperCase() : qsTr("AUTOMATIC REGION")
     }
-    readonly property string friendsNote: {
-        const caps = ShellStore.socialCapabilities || ({})
-        if (!caps.friendsAvailable && caps.reason)
-            return String(caps.reason)
-        return qsTr("Friends activity is not available from GeForce NOW")
-    }
-    readonly property var badgeLabels: {
-        const game = root.game
-        const labels = []
-        const seen = {}
-        function add(label) {
-            const text = String(label || "").trim()
-            const key = text.toUpperCase()
-            if (!text || seen[key])
-                return
-            seen[key] = true
-            labels.push(text)
-        }
-        if (!game)
-            return labels
-        if (root.gameAvailable)
-            add(qsTr("READY TO PLAY"))
-        else if (game.playabilityState)
-            add(String(game.playabilityState).replace(/_/g, " "))
-        const playType = String(game.playType || "").replace(/_/g, " ")
-        if (playType && playType.toUpperCase() !== "READY TO PLAY")
-            add(playType)
-        const controls = game.supportedControls || []
-        for (let i = 0; i < controls.length; ++i) {
-            const control = String(controls[i] || "").toUpperCase()
-            if (control === "GAMEPAD")
-                add(qsTr("CONTROLLER"))
-            else if (control === "KEYBOARD_MOUSE" || control === "KEYBOARD AND MOUSE")
-                add(qsTr("KEYBOARD"))
-            else if (control)
-                add(control.replace(/_/g, " "))
-        }
-        if (root.hasRtx)
-            add("RTX")
-        if (game.membershipTierLabel)
-            add(String(game.membershipTierLabel))
-        return labels
-    }
-    readonly property var factItems: {
-        const game = root.game || ({})
-        const items = [{l: qsTr("LAST PLAYED"), v: root.lastPlayedText}]
-        if (game.hoursPlayed)
-            items.push({l: qsTr("HOURS PLAYED"), v: qsTr("%1 h").arg(game.hoursPlayed)})
-        if (game.sessionCount)
-            items.push({l: qsTr("SESSIONS"), v: String(game.sessionCount)})
-        items.push({l: qsTr("STORES"), v: root.storesText})
-        items.push({l: qsTr("AVAILABLE"), v: root.gameAvailable ? qsTr("Yes") : qsTr("No")})
-        return items
-    }
-    readonly property var streamRows: [
-        {l: qsTr("Resolution"), v: root.resolutionText},
-        {l: qsTr("Frame rate"), v: root.fpsText},
-        {l: qsTr("Codec"), v: root.codecText}
-    ]
+    readonly property string streamSummary: [resolutionText, fpsText, codecText].join(" \u00B7 ")
+    readonly property bool launchReady: ShellStore.signedIn && root.gameAvailable
+    readonly property bool launchBusy: ShellStore.cloudMutationBusy || ShellStore.launchInspectRequestId !== ""
 
     function revealFocusedControl() {
         if (!root.opened || !root.Window.window)
@@ -210,10 +137,10 @@ FocusScope {
 
     function tune() { AppController.navigate("settings-streaming") }
     readonly property var summaryCards: [
-        {glyph:"monitor", title:resolutionText + " · " + fpsText, detail:codecText + " · " + String(streamSettings.colorQuality || "8bit_420").replace("_", " ")},
-        {glyph:"globe", title:regionLabel(), detail:qsTr("Region selected at launch")},
-        {glyph:"clock", title:membershipText || qsTr("Membership"), detail:ShellStore.subscription && ShellStore.subscription.remainingHours !== undefined
-            ? qsTr("%1 h remaining").arg(Math.max(0, Number(ShellStore.subscription.remainingHours)).toFixed(1)) : qsTr("Entitlements checked at launch")}
+        {label:qsTr("Stream"), title:resolutionText + " \u00B7 " + fpsText, detail:codecText + " \u00B7 " + String(streamSettings.colorQuality || "8bit_420").replace("_", " "), mono:true},
+        {label:qsTr("Region"), title:regionLabel(), detail:qsTr("Region selected at launch"), mono:false},
+        {label:qsTr("Membership"), title:membershipText || qsTr("Membership"), detail:ShellStore.subscription && ShellStore.subscription.remainingHours !== undefined
+            ? qsTr("%1 h remaining").arg(Math.max(0, Number(ShellStore.subscription.remainingHours)).toFixed(1)) : qsTr("Entitlements checked at launch"), mono:false}
     ]
     function regionLabel() {
         const value = String(streamSettings.region || "")
@@ -274,27 +201,35 @@ FocusScope {
                     }
                     Column {
                         id: headerInfo
-                        x: DesktopTokens.px(24); anchors.bottom: parent.bottom; anchors.bottomMargin: DesktopTokens.px(24)
-                        width: parent.width - DesktopTokens.px(48); spacing: DesktopTokens.px(8)
+                        x: DesktopTokens.px(28); anchors.bottom: parent.bottom; anchors.bottomMargin: DesktopTokens.px(24)
+                        width: parent.width - DesktopTokens.px(56); spacing: DesktopTokens.px(10)
+                        Row {
+                            spacing: DesktopTokens.px(8)
+                            Rectangle {
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: DesktopTokens.px(7); height: width; radius: width / 2
+                                color: root.launchReady ? Theme.focus : DesktopTokens.amber
+                            }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: root.ownershipText
+                                color: Theme.label; opacity: 0.86
+                                font.family: Theme.monoFont; font.pixelSize: DesktopTokens.smallSize
+                                font.weight: Font.DemiBold; font.letterSpacing: 1.2
+                            }
+                        }
                         Text {
                             width: parent.width; text: root.game ? String(root.game.title || qsTr("Game")) : qsTr("Game")
                             color: Theme.label; font.family: Theme.displayFont
-                            font.pixelSize: DesktopTokens.px(34); font.weight: Font.Black
+                            font.pixelSize: DesktopTokens.px(40); font.weight: Font.Black; font.letterSpacing: -0.8
+                            lineHeight: 0.95; lineHeightMode: Text.ProportionalHeight
                             wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
                         }
-                        Flow {
-                            width: parent.width; spacing: DesktopTokens.px(10)
-                            Rectangle {
-                                width: Math.min(parent.width, ownedText.implicitWidth + DesktopTokens.px(20))
-                                height: DesktopTokens.px(26); radius: DesktopTokens.px(13); color: DesktopTokens.raisedStrong
-                                Text { id: ownedText; anchors.centerIn: parent; width: parent.width - DesktopTokens.px(20); elide: Text.ElideRight; text: root.ownershipText; color: Theme.label; font.family: Theme.bodyFont; font.pixelSize: DesktopTokens.captionSize; font.weight: Font.Bold }
-                            }
-                            Text {
-                                width: Math.min(implicitWidth, parent.width)
-                                wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
-                                text: [root.game && (root.game.publisherName || root.game.publisher) || "", root.lastPlayedText, root.game && root.game.hoursPlayed ? qsTr("%1 h").arg(root.game.hoursPlayed) : ""].filter(Boolean).join(" · ")
-                                color: Theme.textMuted; font.family: Theme.bodyFont; font.pixelSize: DesktopTokens.captionSize
-                            }
+                        Text {
+                            width: parent.width
+                            wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
+                            text: [root.game && (root.game.publisherName || root.game.publisher) || "", root.lastPlayedText, root.game && root.game.hoursPlayed ? qsTr("%1 h").arg(root.game.hoursPlayed) : ""].filter(Boolean).join(" \u00B7 ")
+                            color: Theme.textMuted; font.family: Theme.bodyFont; font.pixelSize: DesktopTokens.captionSize
                         }
                     }
                 }
@@ -304,8 +239,8 @@ FocusScope {
                     Column {
                         id: bodyContent
                         objectName: "gameDetailsBody"
-                        x: DesktopTokens.px(24)
-                        width: parent.width - DesktopTokens.px(48)
+                        x: DesktopTokens.px(28)
+                        width: parent.width - DesktopTokens.px(56)
                         spacing: DesktopTokens.px(20)
                         Column {
                             objectName: "gameDetailsReadiness"
@@ -318,18 +253,24 @@ FocusScope {
                                 text: I18n.source(ShellStore.cloudMutationMessage || ShellStore.selectedLaunchDecision.message || ShellStore.readinessNotice(root.game), I18n.revision)
                                 visible: text !== ""
                                 wrapMode: Text.WordWrap
+                                leftPadding: DesktopTokens.px(14)
+                                Rectangle {
+                                    width: DesktopTokens.px(3); height: parent.height; radius: width / 2
+                                    color: ShellStore.cloudMutationState === "unconfirmed" ? DesktopTokens.danger
+                                        : root.gameAvailable ? Theme.seam : Theme.focus
+                                }
                                 color: ShellStore.cloudMutationState === "unconfirmed" ? (Theme.lightMode ? Qt.darker(DesktopTokens.danger, 2) : DesktopTokens.danger) : Theme.textMuted
                                 font.family: Theme.bodyFont
                                 font.pixelSize: DesktopTokens.captionSize
                             }
                             visible: storeVariants.count > 1 || readinessNoticeLabel.text !== ""
                             Text {
-                                text: qsTr("PLATFORM")
+                                text: qsTr("Choose platform")
                                 visible: storeVariants.count > 1
                                 color: Theme.textMuted
                                 font.family: Theme.bodyFont
-                                font.pixelSize: DesktopTokens.smallSize
-                                font.weight: Font.Bold
+                                font.pixelSize: DesktopTokens.captionSize
+                                font.weight: Font.DemiBold
                             }
                             Flow {
                                 visible: storeVariants.count > 1
@@ -345,14 +286,15 @@ FocusScope {
                                         objectName: "desktopStoreVariant" + index
                                         text: String(modelData.store || qsTr("Unknown"))
                                         height: DesktopTokens.px(36)
-                                        leftPadding: DesktopTokens.px(14)
+                                        cornerRadius: DesktopTokens.px(12)
+                                        tinted: true
+                                        leftPadding: DesktopTokens.px(12)
                                         rightPadding: DesktopTokens.px(14)
                                         font.pixelSize: DesktopTokens.captionSize
                                         implicitWidth: platformContents.implicitWidth + leftPadding + rightPadding
                                         checkable: true
                                         autoExclusive: true
                                         checked: root.game ? index === Number(root.game.selectedVariantIndex || 0) : false
-                                        primary: checked
                                         Accessible.description: ["MANUAL", "PLATFORM_SYNC"].indexOf(modelData.libraryStatus) >= 0
                                             ? qsTr("Owned") : modelData.libraryStatus === "NOT_OWNED" ? qsTr("Not owned") : qsTr("Ownership unconfirmed")
                                         onClicked: root.variantSelected(index)
@@ -383,7 +325,7 @@ FocusScope {
                                                 anchors.verticalCenter: parent.verticalCenter
                                                 text: platformButton.text
                                                 font: platformButton.font
-                                                color: platformButton.checked ? "#0A0D14" : Theme.label
+                                                color: Theme.label
                                             }
                                         }
                                     }
@@ -394,19 +336,117 @@ FocusScope {
                             id: actionRow
                             objectName: "gameDetailsPrimaryActions"
                             width: parent.width
-                            spacing: DesktopTokens.px(10)
-                            DesktopButton {
+                            spacing: DesktopTokens.px(4)
+                            Button {
                                 id: primaryAction
                                 objectName: "desktopGamePlay"
-                                Layout.fillWidth: true; Layout.minimumWidth: 0; Layout.preferredHeight: DesktopTokens.px(52)
-                                font.pixelSize: DesktopTokens.captionSize
-                                leftPadding: DesktopTokens.px(14); rightPadding: DesktopTokens.px(14)
-                                primary: true; glyph: "desktop-play.svg"; text: ShellStore.selectedGameActionLabel(); shortcutText: qsTr("ENTER"); shortcutSequence: "Enter"
-                                enabled: root.game !== null && !ShellStore.cloudMutationBusy && ShellStore.launchInspectRequestId === ""
+                                readonly property bool ready: root.launchReady
+                                readonly property bool busy: root.launchBusy
+                                readonly property color ink: ready ? Theme.focusText : Theme.label
+                                property real pulse: 1
+                                Layout.fillWidth: true; Layout.minimumWidth: 0; Layout.preferredHeight: DesktopTokens.px(64)
+                                Layout.rightMargin: DesktopTokens.px(8)
+                                leftPadding: DesktopTokens.px(12); rightPadding: DesktopTokens.px(18); topPadding: 0; bottomPadding: 0
+                                focusPolicy: Qt.StrongFocus
+                                text: ShellStore.selectedGameActionLabel()
+                                enabled: root.game !== null && !busy
+                                Accessible.name: text
+                                Accessible.description: ready ? root.streamSummary : ""
                                 onClicked: root.playRequested()
+                                SequentialAnimation on pulse {
+                                    running: primaryAction.busy && !AppController.reducedMotion
+                                    loops: Animation.Infinite
+                                    NumberAnimation { to: 0.45; duration: 620; easing.type: Easing.InOutSine }
+                                    NumberAnimation { to: 1; duration: 620; easing.type: Easing.InOutSine }
+                                }
+                                background: Rectangle {
+                                    radius: DesktopTokens.px(18)
+                                    color: primaryAction.ready ? Theme.focus : DesktopTokens.raisedStrong
+                                    border.width: primaryAction.ready ? 0 : 1
+                                    border.color: Theme.seam
+                                    opacity: primaryAction.enabled || primaryAction.busy ? 1 : 0.5
+                                    scale: primaryAction.down && !AppController.reducedMotion ? 0.98 : 1
+                                    Behavior on color { ColorAnimation { duration: DesktopTokens.quickDuration } }
+                                    Behavior on scale { NumberAnimation { duration: DesktopTokens.quickDuration; easing.type: Easing.OutCubic } }
+                                    Rectangle {
+                                        anchors.fill: parent; radius: parent.radius
+                                        color: primaryAction.ready ? "#FFFFFF" : Theme.label
+                                        opacity: primaryAction.hovered && primaryAction.enabled ? (primaryAction.ready ? 0.16 : 0.07) : 0
+                                        Behavior on opacity { NumberAnimation { duration: DesktopTokens.quickDuration } }
+                                    }
+                                    Rectangle {
+                                        anchors.fill: parent; anchors.margins: 1; radius: parent.radius - 1
+                                        color: "transparent"; border.width: 1
+                                        border.color: "#38FFFFFF"
+                                        visible: primaryAction.ready
+                                    }
+                                    Rectangle {
+                                        anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3
+                                        color: "transparent"; border.width: 2; border.color: DesktopTokens.focus
+                                        visible: primaryAction.activeFocus
+                                    }
+                                }
+                                contentItem: RowLayout {
+                                    spacing: DesktopTokens.px(14)
+                                    opacity: primaryAction.enabled || primaryAction.busy ? 1 : 0.5
+                                    Item {
+                                        visible: primaryAction.ready
+                                        Layout.preferredWidth: DesktopTokens.px(40); Layout.preferredHeight: DesktopTokens.px(40)
+                                        Layout.alignment: Qt.AlignVCenter
+                                        Rectangle {
+                                            anchors.fill: parent; radius: width / 2
+                                            color: Qt.rgba(primaryAction.ink.r, primaryAction.ink.g, primaryAction.ink.b, 0.14)
+                                        }
+                                        // Play triangle nudged right of centre: a centred triangle reads as left-heavy.
+                                        Shape {
+                                            anchors.centerIn: parent
+                                            anchors.horizontalCenterOffset: DesktopTokens.px(2)
+                                            width: DesktopTokens.px(14); height: DesktopTokens.px(16)
+                                            layer.enabled: true; layer.samples: 4
+                                            ShapePath {
+                                                fillColor: primaryAction.ink; strokeColor: primaryAction.ink
+                                                strokeWidth: 2; joinStyle: ShapePath.RoundJoin
+                                                startX: 1; startY: 1
+                                                PathLine { x: DesktopTokens.px(14) - 1; y: DesktopTokens.px(16) / 2 }
+                                                PathLine { x: 1; y: DesktopTokens.px(16) - 1 }
+                                                PathLine { x: 1; y: 1 }
+                                            }
+                                        }
+                                    }
+                                    ColumnLayout {
+                                        Layout.fillWidth: true; Layout.minimumWidth: 0; Layout.alignment: Qt.AlignVCenter
+                                        Layout.leftMargin: primaryAction.ready ? 0 : DesktopTokens.px(6)
+                                        spacing: DesktopTokens.px(2)
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: primaryAction.text; elide: Text.ElideRight
+                                            color: primaryAction.ink
+                                            opacity: primaryAction.busy ? primaryAction.pulse : 1
+                                            font.family: Theme.displayFont; font.pixelSize: DesktopTokens.px(19)
+                                            font.weight: Font.Black; font.letterSpacing: -0.2
+                                        }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            visible: primaryAction.ready
+                                            text: root.streamSummary; elide: Text.ElideRight
+                                            color: primaryAction.ink; opacity: 0.72
+                                            font.family: Theme.monoFont; font.pixelSize: DesktopTokens.monoSize
+                                        }
+                                    }
+                                    KeyboardGlyph {
+                                        visible: primaryAction.enabled
+                                        Layout.alignment: Qt.AlignVCenter
+                                        shortcut: "Enter"
+                                        keySize: DesktopTokens.px(22)
+                                        ink: primaryAction.ink
+                                        opacity: 0.8
+                                        Accessible.name: qsTr("ENTER")
+                                    }
+                                }
                             }
                             DesktopButton {
-                                Layout.preferredWidth: DesktopTokens.px(52); Layout.preferredHeight: DesktopTokens.px(52)
+                                Layout.preferredWidth: DesktopTokens.px(48); Layout.preferredHeight: DesktopTokens.px(48); Layout.alignment: Qt.AlignVCenter
+                                quiet: true; cornerRadius: DesktopTokens.px(14); glyphSize: DesktopTokens.px(18)
                                 themedGlyph: "star"; leftPadding: 0; rightPadding: 0
                                 Accessible.name: root.game && ShellStore.isCloudFavorite(root.game) ? qsTr("Remove from GeForce NOW favorites") : qsTr("Add to GeForce NOW favorites")
                                 ToolTip.visible: hovered; ToolTip.text: Accessible.name
@@ -414,7 +454,8 @@ FocusScope {
                                 onClicked: if (root.game) ShellStore.toggleCloudFavorite(root.game)
                             }
                             DesktopButton {
-                                Layout.preferredWidth: DesktopTokens.px(52); Layout.preferredHeight: DesktopTokens.px(52)
+                                Layout.preferredWidth: DesktopTokens.px(48); Layout.preferredHeight: DesktopTokens.px(48); Layout.alignment: Qt.AlignVCenter
+                                quiet: true; cornerRadius: DesktopTokens.px(14); glyphSize: DesktopTokens.px(18)
                                 themedGlyph: "folder"; leftPadding: 0; rightPadding: 0
                                 Accessible.name: qsTr("Collections")
                                 ToolTip.visible: hovered; ToolTip.text: Accessible.name
@@ -425,9 +466,11 @@ FocusScope {
                                 }
                             }
                             DesktopButton {
-                                Layout.preferredWidth: DesktopTokens.px(52); Layout.preferredHeight: DesktopTokens.px(52)
+                                Layout.preferredWidth: DesktopTokens.px(48); Layout.preferredHeight: DesktopTokens.px(48); Layout.alignment: Qt.AlignVCenter
+                                quiet: true; cornerRadius: DesktopTokens.px(14); glyphSize: DesktopTokens.px(18)
                                 themedGlyph: "more"; leftPadding: 0; rightPadding: 0
                                 Accessible.name: qsTr("More game actions")
+                                ToolTip.visible: hovered; ToolTip.text: Accessible.name
                                 onClicked: moreMenu.popup()
                                 Menu {
                                     id: moreMenu
@@ -441,50 +484,47 @@ FocusScope {
                             game: root.game
                             showFavorites: false
                             showStatus: false
+                            quiet: true
                         }
-                        GridLayout {
+                        Rectangle {
                             id: summaryGrid
                             objectName: "gameDetailsSummary"
                             width: parent.width
-                            columns: width < DesktopTokens.px(620) ? 2 : 4
-                            uniformCellWidths: columns === 2
-                            columnSpacing: DesktopTokens.px(10); rowSpacing: DesktopTokens.px(10)
-                            Repeater {
-                                model: root.summaryCards
-                                delegate: Rectangle {
-                                    required property var modelData
-                                    objectName: "gameDetailsSummaryCard"
-                                    Layout.fillWidth: true; Layout.minimumWidth: 0; Layout.preferredHeight: DesktopTokens.px(68)
-                                    Layout.preferredWidth: DesktopTokens.px(180)
-                                    radius: DesktopTokens.px(16); color: DesktopTokens.raised
-                                    RowLayout {
-                                        anchors.fill: parent; anchors.margins: DesktopTokens.px(12); spacing: DesktopTokens.px(12)
-                                        Rectangle {
-                                            Layout.preferredWidth: DesktopTokens.px(36); Layout.preferredHeight: DesktopTokens.px(36)
-                                            radius: DesktopTokens.px(11); color: DesktopTokens.raised
-                                            // Paper's accent icons sit on their own tile. Never use
-                                            // the fixed dark-ink settings SVGs on a dark surface.
-                                            DesktopSettingsIcon {
-                                                anchors.centerIn: parent; width: DesktopTokens.px(18); height: DesktopTokens.px(18)
-                                                glyph: modelData.glyph
-                                                ink: Theme.lightMode ? Theme.label : Theme.focus
-                                            }
-                                        }
-                                        ColumnLayout {
-                                            Layout.fillWidth: true; Layout.minimumWidth: 0; spacing: DesktopTokens.px(2)
-                                            Text { Layout.fillWidth: true; Layout.minimumWidth: 0; text: modelData.title; elide: Text.ElideRight; color: Theme.label; font.family: Theme.bodyFont; font.pixelSize: DesktopTokens.captionSize; font.weight: Font.Bold }
-                                            Text { Layout.fillWidth: true; Layout.minimumWidth: 0; text: modelData.detail; elide: Text.ElideRight; color: Theme.textMuted; font.family: Theme.bodyFont; font.pixelSize: DesktopTokens.smallSize }
+                            height: summaryLayout.implicitHeight + DesktopTokens.px(32)
+                            radius: DesktopTokens.px(16); color: DesktopTokens.raised
+                            GridLayout {
+                                id: summaryLayout
+                                anchors.fill: parent; anchors.margins: DesktopTokens.px(16)
+                                columns: summaryGrid.width < DesktopTokens.px(620) ? 2 : 4
+                                uniformCellWidths: columns === 2
+                                columnSpacing: DesktopTokens.px(20); rowSpacing: DesktopTokens.px(16)
+                                Repeater {
+                                    model: root.summaryCards
+                                    delegate: Item {
+                                        id: specCell
+                                        required property var modelData
+                                        objectName: "gameDetailsSummaryCard"
+                                        Layout.fillWidth: true; Layout.minimumWidth: 0; Layout.preferredWidth: DesktopTokens.px(160)
+                                        Layout.alignment: Qt.AlignTop
+                                        implicitHeight: specColumn.implicitHeight
+                                        Layout.preferredHeight: specColumn.implicitHeight
+                                        Column {
+                                            id: specColumn
+                                            width: parent.width; spacing: DesktopTokens.px(3)
+                                            Text { width: parent.width; text: specCell.modelData.label; elide: Text.ElideRight; color: Theme.textMuted; font.family: Theme.bodyFont; font.pixelSize: DesktopTokens.smallSize; font.weight: Font.DemiBold }
+                                            Text { width: parent.width; text: specCell.modelData.title; elide: Text.ElideRight; color: Theme.label; font.family: specCell.modelData.mono ? Theme.monoFont : Theme.bodyFont; font.pixelSize: DesktopTokens.bodySize; font.weight: Font.Bold }
+                                            Text { width: parent.width; text: specCell.modelData.detail; elide: Text.ElideRight; color: Theme.textMuted; font.family: specCell.modelData.mono ? Theme.monoFont : Theme.bodyFont; font.pixelSize: DesktopTokens.smallSize }
                                         }
                                     }
                                 }
-                            }
-                            DesktopButton {
-                                objectName: "gameDetailsTune"
-                                Layout.fillWidth: summaryGrid.columns === 2
-                                Layout.preferredWidth: Math.max(implicitWidth, DesktopTokens.px(68)); Layout.preferredHeight: DesktopTokens.px(68)
-                                font.pixelSize: DesktopTokens.captionSize
-                                text: qsTr("Tune"); themedGlyph: "sliders"; leftPadding: DesktopTokens.px(6); rightPadding: DesktopTokens.px(6)
-                                onClicked: root.tune()
+                                DesktopButton {
+                                    objectName: "gameDetailsTune"
+                                    Layout.alignment: Qt.AlignVCenter | Qt.AlignRight; Layout.preferredHeight: DesktopTokens.px(40)
+                                    quiet: true; cornerRadius: DesktopTokens.px(12)
+                                    font.pixelSize: DesktopTokens.captionSize
+                                    text: qsTr("Tune"); themedGlyph: "sliders"; leftPadding: DesktopTokens.px(12); rightPadding: DesktopTokens.px(12)
+                                    onClicked: root.tune()
+                                }
                             }
                         }
                     }

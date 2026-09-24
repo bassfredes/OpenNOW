@@ -7,7 +7,7 @@ AbstractButton {
     id: root
     property bool consoleMode: false
     property bool selected: false
-    property color accent: Theme.accentColor("green")
+    property color accent: Theme.focus
     implicitHeight: preview.height + foot.height + DesktopTokens.px(4)
     hoverEnabled: true
     Accessible.role: Accessible.RadioButton
@@ -18,7 +18,7 @@ AbstractButton {
         radius: DesktopTokens.px(16)
         color: Theme.lightMode ? Theme.glass : "#C70B0F1A"
         border.width: root.selected || root.activeFocus ? 2 : 1
-        border.color: root.activeFocus ? Theme.focus : root.selected ? root.accent : Theme.seam
+        border.color: root.activeFocus ? Theme.focus : root.selected ? root.accent : root.hovered ? DesktopTokens.textFaint : Theme.seam
         Behavior on border.color { ColorAnimation { duration: DesktopTokens.quickDuration } }
     }
 
@@ -59,13 +59,13 @@ AbstractButton {
             anchors.right: parent.right; anchors.top: parent.top
             anchors.margins: DesktopTokens.px(12)
             width: defaultLabel.implicitWidth + DesktopTokens.px(20)
-            height: DesktopTokens.px(26); radius: height / 2
-            color: "#6EE7B7"; border.color: "#596EE7B7"
+            height: DesktopTokens.px(26); radius: DesktopTokens.px(8)
+            color: Theme.focus
             Text {
                 id: defaultLabel
                 anchors.centerIn: parent
                 text: qsTr("DEFAULT · DESKTOP MODE")
-                color: "#0B0F1A"; font.family: Theme.monoFont
+                color: Theme.focusText; font.family: Theme.monoFont
                 font.pixelSize: DesktopTokens.px(10); font.weight: Font.Bold
             }
         }

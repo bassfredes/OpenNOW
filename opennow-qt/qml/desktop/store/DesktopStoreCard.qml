@@ -53,7 +53,7 @@ Item {
         height: root.artHeight + DesktopTokens.cardOutlinePad * 2
         radius: DesktopTokens.px(14)
         color: "transparent"
-        border.width: root.selected ? 2 : 1
+        border.width: root.selected ? 2 : 0
         border.color: root.selected ? DesktopTokens.focus : DesktopTokens.cardOutlineIdle
 
         Behavior on border.color {

@@ -18,10 +18,11 @@ Button {
 
     background: Rectangle {
         radius: DesktopTokens.px(9)
-        color: root.selected || root.down ? DesktopTokens.raisedStrong
-                                          : root.hovered ? DesktopTokens.raised : DesktopTokens.seamSoft
-        border.width: 1
-        border.color: root.selected || root.hovered ? DesktopTokens.seam : DesktopTokens.seamSoft
+        color: root.selected ? Qt.rgba(DesktopTokens.focus.r, DesktopTokens.focus.g, DesktopTokens.focus.b, root.down ? 0.26 : 0.16)
+             : root.down ? DesktopTokens.raisedStrong
+             : root.hovered ? DesktopTokens.raised : DesktopTokens.seamSoft
+        border.width: root.selected ? 1 : 0
+        border.color: DesktopTokens.focus
 
         Behavior on color {
             ColorAnimation { duration: Theme.focusDuration }

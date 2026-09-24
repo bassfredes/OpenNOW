@@ -777,7 +777,7 @@ FocusScope {
         y: Math.max(12, Math.min(chips.y + anchorChip.y + anchorChip.height + 6 - content.contentY, root.height - height - 12))
         width: Math.min(DesktopTokens.px(284), root.width - 24)
         height: Math.min(menuColumn.contentHeight + 12, DesktopTokens.px(332), root.height - 24)
-        radius: DesktopTokens.px(11)
+        radius: DesktopTokens.px(14)
         color: Theme.lightMode ? "#F7F9FC" : "#0B0F1A"
         border.width: 1
         border.color: DesktopTokens.seam
@@ -804,8 +804,11 @@ FocusScope {
                     padding: 0
                     focusPolicy: Qt.NoFocus
                     hoverEnabled: true
+                    readonly property bool current: root.openMenu === "genre" ? root.activeGenre === modelData
+                        : root.openMenu === "category" ? root.activeCategoryId === modelData
+                        : root.activeStore === modelData
                     background: Rectangle {
-                        radius: 7
+                        radius: 9
                         color: menuButton.hovered || root.menuIndex === menuButton.index
                                ? DesktopTokens.raisedStrong : "transparent"
                     }
@@ -834,9 +837,17 @@ FocusScope {
                         color: DesktopTokens.text
                         font.family: Theme.bodyFont
                         font.pixelSize: DesktopTokens.monoSize
-                        font.weight: Font.DemiBold
+                        font.weight: menuButton.current ? Font.ExtraBold : Font.DemiBold
                         verticalAlignment: Text.AlignVCenter
                         wrapMode: Text.Wrap
+                      }
+                      // Marks the option that is applied right now.
+                      Rectangle {
+                        visible: menuButton.current
+                        anchors.right: parent.right; anchors.rightMargin: DesktopTokens.px(9)
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: DesktopTokens.px(6); height: width; radius: width / 2
+                        color: DesktopTokens.focus
                       }
                     }
                     onClicked: {
@@ -869,8 +880,9 @@ FocusScope {
                   : qsTr("No games match these filters")
             color: DesktopTokens.text
             font.family: Theme.displayFont
-            font.pixelSize: DesktopTokens.px(22)
+            font.pixelSize: DesktopTokens.px(24)
             font.weight: Font.Black
+            font.letterSpacing: -0.5
         }
         Text {
             anchors.horizontalCenter: parent.horizontalCenter

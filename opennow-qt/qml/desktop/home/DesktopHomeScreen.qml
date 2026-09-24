@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Effects
+import QtQuick.Shapes
 import OpenNOW
 
 FocusScope {
@@ -303,9 +304,9 @@ FocusScope {
                                 text: root.heroGame ? String(root.heroGame.title || qsTr("Game")) : qsTr("No games yet")
                                 color: "#FFFFFF"
                                 font.family: Theme.displayFont
-                                font.pixelSize: 34
+                                font.pixelSize: 40
                                 font.weight: Font.Black
-                                font.letterSpacing: -1
+                                font.letterSpacing: -1.2
                             }
                             Text {
                                 text: root.heroMeta()
@@ -317,23 +318,86 @@ FocusScope {
                         }
 
                         Row {
-                            spacing: 9
+                            spacing: 10
 
                             Rectangle {
                                 id: startButton
-                                width: 158
-                                height: 38
-                                radius: 10
-                                color: startTap.pressed ? "#D9FFFFFF" : "#F2FFFFFF"
-                                border.width: root.focusZone === 0 && root.focusIndex === 0 && AppController.inputMode !== "pointer" ? 2 : 0
-                                border.color: "#FFFFFF"
+                                readonly property color ink: Theme.focusText
+                                readonly property bool keyboardFocused: root.focusZone === 0 && root.focusIndex === 0 && AppController.inputMode !== "pointer"
+                                width: Math.max(208, startContent.implicitWidth + 30)
+                                height: 56
+                                radius: 16
+                                color: Theme.focus
+                                scale: startTap.pressed && !AppController.reducedMotion ? 0.98 : 1
+                                Behavior on scale { NumberAnimation { duration: AppController.reducedMotion ? 0 : 120; easing.type: Easing.OutCubic } }
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: parent.radius
+                                    color: "#FFFFFF"
+                                    opacity: startHover.hovered ? 0.16 : 0
+                                    Behavior on opacity { NumberAnimation { duration: AppController.reducedMotion ? 0 : 120 } }
+                                }
+                                Rectangle {
+                                    anchors.fill: parent
+                                    anchors.margins: 1
+                                    radius: parent.radius - 1
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#38FFFFFF"
+                                }
+                                Rectangle {
+                                    anchors.fill: parent
+                                    anchors.margins: -3
+                                    radius: parent.radius + 3
+                                    color: "transparent"
+                                    border.width: 2
+                                    border.color: "#FFFFFF"
+                                    visible: startButton.keyboardFocused
+                                }
 
                                 Row {
-                                    anchors.centerIn: parent
-                                    spacing: 8
-                                    DesktopGlyph { width: 10; height: 12; icon: "desktop-play.svg" }
-                                    Text { text: qsTr("Start"); color: "#0B0F1A"; font.family: Theme.bodyFont; font.pixelSize: 14; font.weight: Font.ExtraBold }
-                                    KeyboardGlyph { shortcut: "Enter"; keySize: 20; ink: "#0B0F1A"; Accessible.name: qsTr("ENTER") }
+                                    id: startContent
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    x: 10
+                                    spacing: 12
+                                    Item {
+                                        width: 36
+                                        height: 36
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        Rectangle {
+                                            anchors.fill: parent
+                                            radius: width / 2
+                                            color: Qt.rgba(startButton.ink.r, startButton.ink.g, startButton.ink.b, 0.14)
+                                        }
+                                        // Nudged right of centre: a centred triangle reads left-heavy.
+                                        Shape {
+                                            anchors.centerIn: parent
+                                            anchors.horizontalCenterOffset: 2
+                                            width: 13
+                                            height: 15
+                                            layer.enabled: true
+                                            layer.samples: 4
+                                            ShapePath {
+                                                fillColor: startButton.ink
+                                                strokeColor: startButton.ink
+                                                strokeWidth: 2
+                                                joinStyle: ShapePath.RoundJoin
+                                                startX: 1
+                                                startY: 1
+                                                PathLine { x: 12; y: 7.5 }
+                                                PathLine { x: 1; y: 14 }
+                                                PathLine { x: 1; y: 1 }
+                                            }
+                                        }
+                                    }
+                                    Column {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        spacing: 2
+                                        Text { text: qsTr("Start"); color: startButton.ink; font.family: Theme.displayFont; font.pixelSize: 18; font.weight: Font.Black; font.letterSpacing: -0.2 }
+                                        Text { text: root.streamChip(); color: startButton.ink; opacity: 0.72; font.family: Theme.monoFont; font.pixelSize: 11 }
+                                    }
+                                    KeyboardGlyph { anchors.verticalCenter: parent.verticalCenter; shortcut: "Enter"; keySize: 20; ink: startButton.ink; opacity: 0.8; Accessible.name: qsTr("ENTER") }
                                 }
                                 HoverHandler { id: startHover; cursorShape: Qt.PointingHandCursor; onHoveredChanged: if (hovered) root.setSelection(0, 0) }
                                 TapHandler { id: startTap; onTapped: root.startHero() }
@@ -341,9 +405,10 @@ FocusScope {
 
                             Rectangle {
                                 id: detailsButton
-                                width: 81
-                                height: 38
-                                radius: 10
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 96
+                                height: 44
+                                radius: 14
                                 color: detailsHover.hovered ? "#2EFFFFFF" : "#1FFFFFFF"
                                 border.width: root.focusZone === 0 && root.focusIndex === 1 && AppController.inputMode !== "pointer" ? 2 : 1
                                 border.color: root.focusZone === 0 && root.focusIndex === 1 && AppController.inputMode !== "pointer" ? "#FFFFFF" : "#33FFFFFF"
@@ -351,21 +416,6 @@ FocusScope {
                                 HoverHandler { id: detailsHover; cursorShape: Qt.PointingHandCursor; onHoveredChanged: if (hovered) root.setSelection(0, 1) }
                                 TapHandler { onTapped: root.openGame(root.heroGame) }
                                 Behavior on color { ColorAnimation { duration: AppController.reducedMotion ? 0 : 90 } }
-                            }
-
-                            Rectangle {
-                                width: 182
-                                height: 38
-                                radius: 10
-                                color: "#59000000"
-                                border.width: 1
-                                border.color: "#1FFFFFFF"
-                                Row {
-                                    anchors.centerIn: parent
-                                    spacing: 8
-                                    Rectangle { width: 6; height: 6; radius: 3; color: "#1DB954" }
-                                    Text { text: root.streamChip(); color: "#CCFFFFFF"; font.family: Theme.monoFont; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 0.4 }
-                                }
                             }
                         }
                     }
