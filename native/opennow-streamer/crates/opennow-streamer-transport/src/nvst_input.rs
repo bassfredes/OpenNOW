@@ -1178,8 +1178,10 @@ fn activation_chain(timestamp_us: u64) -> Vec<Vec<u8>> {
 }
 
 fn mouse_settings_enabled() -> bool {
-    // A/B switch: only an explicit "0" turns the mouse-settings frame off.
-    std::env::var("OPENNOW_MOUSE_SETTINGS").as_deref() != Ok("0")
+    // Opt-in A/B switch: the 0x0323 frame never produced the expected 0x0110
+    // server response, and the best live sessions ran with it off, so it now
+    // takes an explicit OPENNOW_MOUSE_SETTINGS=1 to enable it.
+    std::env::var("OPENNOW_MOUSE_SETTINGS").as_deref() == Ok("1")
 }
 
 fn mouse_settings_accel_first() -> bool {
@@ -1621,7 +1623,7 @@ mod tests {
     }
 
     #[test]
-    fn activation_chain_appends_mouse_settings_by_default() {
+    fn activation_chain_omits_mouse_settings_by_default() {
         let _guard = MOUSE_SETTINGS_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1632,34 +1634,35 @@ mod tests {
             std::env::remove_var("OPENNOW_MOUSE_SETTINGS_ORDER");
         }
         let chain = activation_chain(20_102_193);
-        assert_eq!(chain.len(), 9);
-        assert_eq!(
-            chain[8],
-            hex("230308000a00000000000000"),
-            "default frame is the official speed=10 accel=0, speed first"
+        assert_eq!(chain.len(), 8);
+        assert!(
+            chain
+                .iter()
+                .all(|message| !message.starts_with(&COMMAND_MOUSE_SETTINGS.to_le_bytes())),
+            "the 0x0323 frame is opt-in and must be absent from the default chain"
         );
     }
 
     #[test]
-    fn activation_chain_omits_mouse_settings_when_disabled() {
+    fn activation_chain_appends_mouse_settings_when_opted_in() {
         let _guard = MOUSE_SETTINGS_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: same serialization contract as
-        // activation_chain_appends_mouse_settings_by_default.
+        // activation_chain_omits_mouse_settings_by_default.
         unsafe {
-            std::env::set_var("OPENNOW_MOUSE_SETTINGS", "0");
+            std::env::set_var("OPENNOW_MOUSE_SETTINGS", "1");
             std::env::remove_var("OPENNOW_MOUSE_SETTINGS_ORDER");
         }
         let chain = activation_chain(20_102_193);
         unsafe {
             std::env::remove_var("OPENNOW_MOUSE_SETTINGS");
         }
-        assert_eq!(chain.len(), 8);
-        assert!(
-            chain
-                .iter()
-                .all(|message| !message.starts_with(&COMMAND_MOUSE_SETTINGS.to_le_bytes()))
+        assert_eq!(chain.len(), 9);
+        assert_eq!(
+            chain[8],
+            hex("230308000a00000000000000"),
+            "opted-in frame is the official speed=10 accel=0, speed first"
         );
     }
 

@@ -21,6 +21,7 @@ use crc32fast::hash as crc32;
 use ctr::{Ctr32BE, Ctr128BE};
 use ghash::{GHash, universal_hash::UniversalHash};
 use hmac::{Hmac, Mac};
+use mio::{Events, Interest, Poll, Token, Waker as MioWaker};
 use serde_json::Value;
 use sha1::Sha1;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -152,7 +153,7 @@ impl StreamPingTracker {
     fn receive(
         &mut self,
         packet: &[u8],
-        source: SocketAddr,
+        _source: SocketAddr,
         credentials: &NvstStunCredentials,
         now: Instant,
     ) -> Option<Duration> {
@@ -164,10 +165,15 @@ impl StreamPingTracker {
             .pending
             .iter()
             .position(|(id, _)| id == transaction_id)?;
-        if !matches!(
-            handle_stun_datagram(packet, source, credentials),
-            StunDatagram::Handled(None)
-        ) {
+        // Mirror IceResponseTracker::accept: authenticate with the ICE password
+        // and check the fingerprint only when it is present. The stricter
+        // handle_stun_datagram path requires a fingerprint unconditionally and
+        // silently dropped the seat's NATT success responses, which is why the
+        // controlRtt window stayed at n=0 while ICE still completed.
+        if !valid_stun_message_integrity(packet, credentials.remote_password.as_bytes())
+            || (find_stun_attribute(packet, STUN_ATTR_FINGERPRINT).is_some()
+                && !valid_stun_fingerprint(packet))
+        {
             return None;
         }
         let (_, sent) = self.pending.remove(index)?;
@@ -4561,6 +4567,33 @@ fn make_input_wake(target: &UdpSocket) -> Option<Arc<InputWake>> {
     }))
 }
 
+const WORKER_SOCKET_TOKEN: Token = Token(0);
+const WORKER_WAKE_TOKEN: Token = Token(1);
+
+/// Wake handle for a receive worker's blocking wait.
+///
+/// The bundle worker multiplexes the socket and this waker through `mio::Poll`
+/// (IOCP-backed on Windows), so a queued command interrupts the wait with an OS
+/// event: no datagram can be lost and Windows' ~15.6 ms recv-timeout tick
+/// cannot add residence. The legacy video receiver still blocks in `recv_from`,
+/// where the one-byte loopback datagram is its wake channel.
+#[derive(Clone)]
+enum WorkerWaker {
+    Event(Arc<MioWaker>),
+    Datagram(Arc<InputWake>),
+}
+
+impl WorkerWaker {
+    fn wake(&self) {
+        match self {
+            WorkerWaker::Event(waker) => {
+                let _ = waker.wake();
+            }
+            WorkerWaker::Datagram(wake) => wake.send(),
+        }
+    }
+}
+
 /// Owns the bounded UDP receive worker. Frames go through the same bounded `MediaConsumer` used
 /// by WebRTC, so a slow decoder cannot make UDP receive unbounded.
 pub struct NvstUdpReceiverSession {
@@ -4568,7 +4601,7 @@ pub struct NvstUdpReceiverSession {
     join: Option<JoinHandle<()>>,
     input_ready: Arc<AtomicBool>,
     microphone: Arc<Mutex<MicrophoneQueue>>,
-    wake: Option<Arc<InputWake>>,
+    wake: Option<WorkerWaker>,
 }
 
 #[derive(Clone)]
@@ -4576,7 +4609,7 @@ pub struct NvstUdpReceiverControl {
     commands: Sender<UdpReceiverCommand>,
     input_ready: Arc<AtomicBool>,
     microphone: Arc<Mutex<MicrophoneQueue>>,
-    wake: Option<Arc<InputWake>>,
+    wake: Option<WorkerWaker>,
 }
 
 #[derive(Debug, Error)]
@@ -4634,6 +4667,9 @@ impl NvstUdpReceiverSession {
             queue.close();
         }
         let _ = self.commands.send(UdpReceiverCommand::Stop);
+        if let Some(wake) = &self.wake {
+            wake.wake();
+        }
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -4641,6 +4677,11 @@ impl NvstUdpReceiverSession {
 }
 
 impl NvstUdpReceiverControl {
+    fn wake(&self) {
+        if let Some(wake) = &self.wake {
+            wake.wake();
+        }
+    }
     pub fn queue_text(
         &self,
         text: opennow_streamer_protocol::text_input::UnicodeText,
@@ -4651,7 +4692,9 @@ impl NvstUdpReceiverControl {
         }
         self.commands
             .send(UdpReceiverCommand::SendText { text, timestamp_us })
-            .map_err(|_| TransportError::Closed)
+            .map_err(|_| TransportError::Closed)?;
+        self.wake();
+        Ok(())
     }
 
     pub fn set_microphone_enabled(&self, enabled: bool) -> Result<(), NvstUdpReceiverError> {
@@ -4705,9 +4748,7 @@ impl NvstUdpReceiverControl {
                 reply: Some(reply),
             })
             .map_err(|_| TransportError::Closed)?;
-        if let Some(wake) = &self.wake {
-            wake.send();
-        }
+        self.wake();
         result
             .recv_timeout(Duration::from_millis(500))
             .map_err(|_| TransportError::Closed)?
@@ -4734,9 +4775,7 @@ impl NvstUdpReceiverControl {
                 reply: None,
             })
             .map_err(|_| TransportError::Closed)?;
-        if let Some(wake) = &self.wake {
-            wake.send();
-        }
+        self.wake();
         Ok(())
     }
 
@@ -4751,7 +4790,9 @@ impl NvstUdpReceiverControl {
     fn send(&self, command: UdpReceiverCommand) -> Result<(), NvstUdpReceiverError> {
         self.commands
             .send(command)
-            .map_err(|_| NvstUdpReceiverError::Closed)
+            .map_err(|_| NvstUdpReceiverError::Closed)?;
+        self.wake();
+        Ok(())
     }
 }
 
@@ -4761,6 +4802,9 @@ impl Drop for NvstUdpReceiverSession {
             queue.close();
         }
         let _ = self.commands.send(UdpReceiverCommand::Stop);
+        if let Some(wake) = &self.wake {
+            wake.wake();
+        }
     }
 }
 
@@ -5419,7 +5463,22 @@ fn spawn_receiver_thread(
     socket
         .set_read_timeout(Some(UDP_RECEIVE_POLL_INTERVAL))
         .map_err(NvstUdpReceiverError::Configure)?;
-    let wake = make_input_wake(&socket);
+    // The bundle worker (rtc.is_some()) waits on an event-backed mio poll so a
+    // queued command interrupts the wait immediately; the legacy video worker
+    // keeps its blocking recv_from and the one-byte loopback datagram wake.
+    let (poll, wake) = if rtc.is_some() {
+        let poll = Poll::new().map_err(NvstUdpReceiverError::Configure)?;
+        let waker = MioWaker::new(poll.registry(), WORKER_WAKE_TOKEN)
+            .map_err(NvstUdpReceiverError::Configure)?;
+        (Some(poll), WorkerWaker::Event(Arc::new(waker)))
+    } else {
+        let wake = make_input_wake(&socket).ok_or_else(|| {
+            NvstUdpReceiverError::Configure(std::io::Error::other(
+                "failed to bind the input wake datagram socket",
+            ))
+        })?;
+        (None, WorkerWaker::Datagram(wake))
+    };
     let (commands, receiver) = mpsc::channel();
     let input_ready = Arc::new(AtomicBool::new(false));
     let worker_input_ready = input_ready.clone();
@@ -5450,6 +5509,7 @@ fn spawn_receiver_thread(
                 transport_origin,
                 rtc,
                 hid_runtime,
+                poll,
             );
             worker_input_ready.store(false, Ordering::Release);
             if let Ok(mut queue) = worker_microphone.lock() {
@@ -5467,7 +5527,7 @@ fn spawn_receiver_thread(
         join: Some(join),
         input_ready,
         microphone,
-        wake,
+        wake: Some(wake),
     })
 }
 
@@ -5967,6 +6027,7 @@ fn store_sony_output(
     haptics.store_sony(rumble);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_nvst_webrtc_bundle(
     socket: UdpSocket,
     config: NvstVideoConfig,
@@ -5975,6 +6036,7 @@ fn run_nvst_webrtc_bundle(
     transport_origin: Instant,
     mut rtc: Rtc,
     hid_runtime: Option<Arc<HidRuntime>>,
+    mut poll: Poll,
 ) {
     let NvstReceiverOutputs {
         media_consumer,
@@ -6011,6 +6073,38 @@ fn run_nvst_webrtc_bundle(
     let mut inbound_datagrams = 0_u64;
     let mut outbound_datagrams = 0_u64;
     let mut hole_punch_pings = 0_u64;
+    // The worker's wait is multiplexed through mio: recv only runs when the
+    // socket is readable, and a queued command wakes the poll with an OS event
+    // (IOCP on Windows) instead of depending on a UDP loopback datagram or the
+    // ~15.6 ms recv-timeout tick that made an un-woken wait cost ~12 ms.
+    if let Err(error) = socket.set_nonblocking(true) {
+        log_udp_error("bundle-nonblocking", local_port, &error);
+        eprintln!("NVST UDP nonblocking configuration failed: {error}");
+        forward_optional(&event_sender, receiver.stop());
+        return;
+    }
+    // mio needs its own Source handle; the clone shares the exact socket with
+    // the std handle the worker keeps reading and writing. It must outlive the
+    // receive loop or the registration would be dropped with it.
+    let mut poll_source = match socket.try_clone() {
+        Ok(cloned) => mio::net::UdpSocket::from_std(cloned),
+        Err(error) => {
+            log_udp_error("bundle-poll-source", local_port, &error);
+            eprintln!("NVST WebRTC poll source failed: {error}");
+            forward_optional(&event_sender, receiver.stop());
+            return;
+        }
+    };
+    if let Err(error) =
+        poll.registry()
+            .register(&mut poll_source, WORKER_SOCKET_TOKEN, Interest::READABLE)
+    {
+        log_udp_error("bundle-poll-register", local_port, &error);
+        eprintln!("NVST WebRTC poll registration failed: {error}");
+        forward_optional(&event_sender, receiver.stop());
+        return;
+    }
+    let mut events = Events::with_capacity(4);
     let mut ping_tracker = StreamPingTracker::default();
     let mut ice_responses = IceResponseTracker::default();
     let mut ice_ping_responses = 0;
@@ -6889,109 +6983,134 @@ fn run_nvst_webrtc_bundle(
                 break 'bundle;
             }
         } else {
-            if let Err(error) = socket.set_read_timeout(Some(wait)) {
-                eprintln!("NVST UDP timeout configuration failed: {error}");
+            events.clear();
+            if let Err(error) = poll.poll(&mut events, Some(wait)) {
+                log_udp_error("bundle-poll", local_port, &error);
+                eprintln!("NVST WebRTC poll failed: {error}");
                 forward_optional(&event_sender, receiver.stop());
                 break 'bundle;
             }
-            match socket.recv_from(&mut datagram) {
-                Ok((length, source)) => {
-                    inbound_datagrams += 1;
-                    if inbound_datagrams == 1 {
-                        log_udp_first_inbound(
-                            "bundle",
-                            local_port,
-                            source == bundle_peer,
-                            source,
-                            length,
-                            transport_origin,
-                        );
-                    }
-                    if inbound_datagrams == 1
-                        || (verbose_diagnostics_enabled() && inbound_datagrams % 50 == 0)
-                    {
-                        eprintln!(
-                            "NVST WebRTC inbound={inbound_datagrams} source={source} bytes={length} dtlsReady={dtls_ready}"
-                        );
-                    }
-                    if source != bundle_peer {
-                        continue;
-                    }
-                    if let Some(credentials) = stun_credentials.as_ref() {
-                        let received_at = Instant::now();
-                        if let Some(elapsed) = ping_tracker.receive(
-                            &datagram[..length],
-                            source,
-                            credentials,
-                            received_at,
-                        ) {
-                            feedback.publish_ping(false, received_at, elapsed);
-                            if let Some(diagnostics) = &mut input_diagnostics {
-                                diagnostics.record_control_rtt(elapsed);
+            let socket_ready = events
+                .iter()
+                .any(|event| event.token() == WORKER_SOCKET_TOKEN && event.is_readable());
+            if socket_ready {
+                // Readiness-gated drain: read until WouldBlock so no datagram
+                // stalls behind an edge-triggered readiness event. A wake token
+                // needs no handling here — no events means the poll deadline
+                // expired, anything else returns to the loop top where the
+                // command queue is drained first.
+                loop {
+                    match socket.recv_from(&mut datagram) {
+                        Ok((length, source)) => {
+                            inbound_datagrams += 1;
+                            if inbound_datagrams == 1 {
+                                log_udp_first_inbound(
+                                    "bundle",
+                                    local_port,
+                                    source == bundle_peer,
+                                    source,
+                                    length,
+                                    transport_origin,
+                                );
+                            }
+                            if inbound_datagrams == 1
+                                || (verbose_diagnostics_enabled() && inbound_datagrams % 50 == 0)
+                            {
+                                eprintln!(
+                                    "NVST WebRTC inbound={inbound_datagrams} source={source} bytes={length} dtlsReady={dtls_ready}"
+                                );
+                            }
+                            if source != bundle_peer {
+                                continue;
+                            }
+                            if let Some(credentials) = stun_credentials.as_ref() {
+                                let received_at = Instant::now();
+                                if let Some(elapsed) = ping_tracker.receive(
+                                    &datagram[..length],
+                                    source,
+                                    credentials,
+                                    received_at,
+                                ) {
+                                    feedback.publish_ping(false, received_at, elapsed);
+                                    if let Some(diagnostics) = &mut input_diagnostics {
+                                        diagnostics.record_control_rtt(elapsed);
+                                    }
+                                }
+                            }
+                            if datagram[..length] == *b"PING" {
+                                if let Err(error) = socket.send_to(b"PONG", source) {
+                                    eprintln!("NVST PONG send failed: {error}");
+                                    forward_optional(&event_sender, receiver.stop());
+                                    break 'bundle;
+                                }
+                                continue;
+                            }
+                            if looks_like_rtp(&datagram[..length])
+                                && let Some(ssrc) = peek_rtp_ssrc(&datagram[..length])
+                                && seen_ssrcs.insert(ssrc)
+                            {
+                                let mid = audio_track
+                                    .as_ref()
+                                    .filter(|audio| {
+                                        peek_rtp_payload_type(&datagram[..length]).is_some_and(
+                                            |payload_type| {
+                                                matches_audio_track(audio, payload_type, ssrc)
+                                            },
+                                        )
+                                    })
+                                    .map_or_else(
+                                        || Mid::from("0"),
+                                        |audio| Mid::from(audio.mid.as_str()),
+                                    );
+                                rtc.direct_api().expect_stream_rx(
+                                    Ssrc::from(ssrc),
+                                    None,
+                                    mid,
+                                    None,
+                                );
+                                eprintln!("NVST expecting SSRC {ssrc} on bundle mid={mid}");
+                            }
+                            let destination = receive_destination;
+                            let contents = match datagram[..length].try_into() {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    eprintln!("NVST dropping oversized UDP packet: {error}");
+                                    continue;
+                                }
+                            };
+                            if let Some(credentials) = stun_credentials.as_ref()
+                                && !ice_responses
+                                    .accept(&datagram[..length], &credentials.remote_password)
+                            {
+                                continue;
+                            }
+                            if let Err(error) = rtc.handle_input(Input::Receive(
+                                Instant::now(),
+                                Receive {
+                                    proto: RtcProtocol::Udp,
+                                    source: receive_source,
+                                    destination,
+                                    contents,
+                                },
+                            )) {
+                                eprintln!("NVST WebRTC handle_input failed: {error}");
+                                forward_optional(&event_sender, receiver.stop());
+                                break 'bundle;
                             }
                         }
-                    }
-                    if datagram[..length] == *b"PING" {
-                        if let Err(error) = socket.send_to(b"PONG", source) {
-                            eprintln!("NVST PONG send failed: {error}");
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => {
+                            log_udp_error("bundle-receive", local_port, &error);
                             forward_optional(&event_sender, receiver.stop());
                             break 'bundle;
                         }
-                        continue;
-                    }
-                    if looks_like_rtp(&datagram[..length])
-                        && let Some(ssrc) = peek_rtp_ssrc(&datagram[..length])
-                        && seen_ssrcs.insert(ssrc)
-                    {
-                        let mid = audio_track
-                            .as_ref()
-                            .filter(|audio| {
-                                peek_rtp_payload_type(&datagram[..length]).is_some_and(
-                                    |payload_type| matches_audio_track(audio, payload_type, ssrc),
-                                )
-                            })
-                            .map_or_else(|| Mid::from("0"), |audio| Mid::from(audio.mid.as_str()));
-                        rtc.direct_api()
-                            .expect_stream_rx(Ssrc::from(ssrc), None, mid, None);
-                        eprintln!("NVST expecting SSRC {ssrc} on bundle mid={mid}");
-                    }
-                    let destination = receive_destination;
-                    let contents = match datagram[..length].try_into() {
-                        Ok(value) => value,
-                        Err(error) => {
-                            eprintln!("NVST dropping oversized UDP packet: {error}");
-                            continue;
-                        }
-                    };
-                    if let Some(credentials) = stun_credentials.as_ref()
-                        && !ice_responses.accept(&datagram[..length], &credentials.remote_password)
-                    {
-                        continue;
-                    }
-                    if let Err(error) = rtc.handle_input(Input::Receive(
-                        Instant::now(),
-                        Receive {
-                            proto: RtcProtocol::Udp,
-                            source: receive_source,
-                            destination,
-                            contents,
-                        },
-                    )) {
-                        eprintln!("NVST WebRTC handle_input failed: {error}");
-                        forward_optional(&event_sender, receiver.stop());
-                        break 'bundle;
                     }
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    let _ = rtc.handle_input(Input::Timeout(Instant::now()));
-                }
-                Err(error) => {
-                    log_udp_error("bundle-receive", local_port, &error);
+            } else if events.is_empty() {
+                // Poll deadline reached with no datagram and no wake: str0m's
+                // timer is due (the previous recv-timeout branch).
+                if let Err(error) = rtc.handle_input(Input::Timeout(Instant::now())) {
+                    eprintln!("NVST WebRTC timer failed: {error}");
                     forward_optional(&event_sender, receiver.stop());
                     break 'bundle;
                 }
@@ -7034,6 +7153,7 @@ fn run_nvst_webrtc_bundle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_nvst_udp_receiver(
     socket: UdpSocket,
     config: NvstVideoConfig,
@@ -7042,8 +7162,14 @@ fn run_nvst_udp_receiver(
     transport_origin: Instant,
     rtc: Option<Rtc>,
     hid_runtime: Option<Arc<HidRuntime>>,
+    poll: Option<Poll>,
 ) {
     if let Some(rtc) = rtc {
+        let Some(poll) = poll else {
+            // spawn_receiver_thread always creates the poll alongside the Rtc.
+            eprintln!("NVST WebRTC bundle receiver missing its poll instance");
+            return;
+        };
         run_nvst_webrtc_bundle(
             socket,
             config,
@@ -7052,6 +7178,7 @@ fn run_nvst_udp_receiver(
             transport_origin,
             rtc,
             hid_runtime,
+            poll,
         );
         return;
     }
@@ -11068,6 +11195,58 @@ mod tests {
         // The datagram's source is not the peer, so the worker's existing
         // `source != bundle_peer` check skips straight back to the command
         // drain at the top of the loop.
+    }
+
+    #[test]
+    fn input_wake_interrupts_a_blocked_recv_under_one_millisecond() {
+        // Production bind shape (0.0.0.0, like the reserved bundle port) with
+        // no read timeout: the reader is genuinely blocked in recv_from, and
+        // the wake datagram must return it in well under a millisecond.
+        let worker = UdpSocket::bind("0.0.0.0:0").expect("worker socket");
+        worker.set_read_timeout(None).expect("no read timeout");
+        let wake = make_input_wake(&worker).expect("wake pair");
+        let reader = worker.try_clone().expect("worker clone");
+        let handle = thread::spawn(move || {
+            let mut buffer = [0_u8; 4];
+            reader.recv_from(&mut buffer).expect("wake datagram")
+        });
+        thread::sleep(Duration::from_millis(2));
+        let sent = Instant::now();
+        wake.send();
+        let (length, _source) = handle.join().expect("blocked reader returns");
+        let latency = sent.elapsed();
+        assert_eq!(length, 1);
+        assert!(
+            latency < Duration::from_millis(1),
+            "wake took {latency:?} while recv was blocked"
+        );
+    }
+
+    #[test]
+    fn bundle_waker_interrupts_a_blocked_poll_under_one_millisecond() {
+        // The bundle worker's wait is a mio poll multiplexing the socket and
+        // the waker. With no socket traffic the poll would block for its full
+        // deadline; the waker must return it immediately with its token set.
+        let mut poll = Poll::new().expect("poll");
+        let waker = MioWaker::new(poll.registry(), WORKER_WAKE_TOKEN).expect("waker");
+        let handle = thread::spawn(move || {
+            let mut events = Events::with_capacity(4);
+            poll.poll(&mut events, Some(Duration::from_secs(10)))
+                .expect("poll");
+            events
+                .iter()
+                .any(|event| event.token() == WORKER_WAKE_TOKEN)
+        });
+        thread::sleep(Duration::from_millis(2));
+        let sent = Instant::now();
+        waker.wake().expect("wake");
+        let saw_wake_token = handle.join().expect("blocked poll returns");
+        let latency = sent.elapsed();
+        assert!(saw_wake_token, "wake token must be observed");
+        assert!(
+            latency < Duration::from_millis(1),
+            "waker took {latency:?} while poll was blocked"
+        );
     }
 
     #[test]

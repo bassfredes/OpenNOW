@@ -209,7 +209,7 @@ impl InputDiagnostics {
             return;
         }
         let line = format!(
-            "NVST input stage-timings {} {} {} {} phaseMax{{pollOutUs={} flushUs={} recvUs={} otherUs={}}} controlRtt{}",
+            "NVST input stage-timings {} {} {} {} phaseMax{{pollOutUs={} flushUs={} recvUs={} otherUs={}}} {}",
             self.submit_to_enqueue.summarize("submitToEnqueue"),
             self.enqueue_to_worker.summarize("enqueueToWorker"),
             self.dequeue_to_sctp.summarize("dequeueToSctp"),
