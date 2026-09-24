@@ -929,6 +929,7 @@ pub fn prepare_owned_nvst(
         ),
     );
 
+    let offer = offer_color_overrides(&describe.body);
     let announce_body = build_announce(
         context,
         AnnounceParams {
@@ -946,8 +947,24 @@ pub fn prepare_owned_nvst(
             video_packet_size,
             rtcp_on_sctp,
             microphone_available,
+            offer: &offer,
         },
     );
+    // Sanitized copy of the full ANNOUNCE in the diagnostics log (directive):
+    // ICE ufrag/pwd, DTLS fingerprint and the SRTP key are redacted; the rest
+    // is payload-free configuration so the next official diff is mechanical.
+    let sanitized = sanitize_announce_for_log(&announce_body);
+    for (index, chunk) in sanitized.as_bytes().chunks(3500).enumerate() {
+        opennow_streamer_protocol::log::log_line(
+            "INFO",
+            "nvst-announce",
+            &format!(
+                "part={index} of {} body={}",
+                sanitized.len().div_ceil(3500),
+                String::from_utf8_lossy(chunk)
+            ),
+        );
+    }
     Ok(PreparedNvstRtspSession {
         control_ping: NvstControlPing::default(),
         client: Some(client),
@@ -989,6 +1006,84 @@ struct AnnounceParams<'a> {
     video_packet_size: usize,
     rtcp_on_sctp: bool,
     microphone_available: bool,
+    /// Color/encoder keys the seat offered in its DESCRIBE; when present the
+    /// offer value replaces ours for exactly those keys (official reads its
+    /// config from the SDP, geronimo 20260924 L11697, and the Mac reference
+    /// documents "the seat's value wins for keys we would otherwise
+    /// hardcode").
+    offer: &'a [(String, String)],
+}
+
+/// Redacts the secret-bearing ANNOUNCE lines for diagnostics: ICE ufrag/pwd,
+/// DTLS fingerprint and the SRTP encryption key. Everything else stays
+/// visible so future official diffs are mechanical.
+fn sanitize_announce_for_log(body: &str) -> String {
+    const SECRET_KEYS: [&str; 8] = [
+        "icePassword",
+        "iceUserNameFragment",
+        "dtlsFingerprint",
+        "encryptionKey",
+        "encryptionKeyId",
+        "ice-pwd",
+        "ice-ufrag",
+        "fingerprint",
+    ];
+    body.split("\r\n")
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if SECRET_KEYS
+                .iter()
+                .any(|key| lower.contains(&key.to_ascii_lowercase()))
+                && let Some(colon) = line.find(':')
+            {
+                format!("{}:[redacted]", &line[..colon])
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+/// Color/encoder keys whose value comes from the seat's DESCRIBE offer when
+/// the seat provides it. Always logs the offered values (payload-free config
+/// keys only) so the next live session shows exactly what the seat proposed —
+/// the previous unknown that kept the 4:4:4 gate unobservable.
+fn offer_color_overrides(describe: &str) -> Vec<(String, String)> {
+    const KEYS: [&str; 15] = [
+        "video[0].bitDepth",
+        "video[0].chromaFormat",
+        "video[0].surfaceFormat",
+        "video[0].dynamicRangeMode",
+        "video[0].encoderCscMode",
+        "video[0].encoderHdrCscMode",
+        "video[0].prefilterParams.prefilterMode",
+        "video[0].prefilterParams.prefilterModel",
+        "video[0].prefilterParams.sharpnessLevel",
+        "video[0].prefilterParams.denoiseLevel",
+        "video[0].maxCodecProfile",
+        "video[0].maxCodecLevel",
+        "video[0].maxH264Profile",
+        "video[0].maxH264Level",
+        "vqos[0].H265BitStreamProfile",
+    ];
+    let mut overrides = Vec::new();
+    let mut present = Vec::new();
+    for key in KEYS {
+        if let Some(value) = sdp_attribute(describe, key) {
+            present.push(format!("{key}={value}"));
+            overrides.push((format!("x-nv-{key}"), value));
+        }
+    }
+    if present.is_empty() {
+        present.push("none".to_owned());
+    }
+    opennow_streamer_protocol::log::log_line(
+        "INFO",
+        "nvst-offer-color",
+        &format!("describe offered {}", present.join(" ")),
+    );
+    overrides
 }
 
 fn negotiate_microphone(context: &SessionContext, describe: &str) -> bool {
@@ -1020,6 +1115,18 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
     };
     let dynamic_streaming_mode = negotiated_dynamic_streaming_mode(context);
     let adjust_res_and_fps = negotiated_adjustment_enabled(dynamic_streaming_mode);
+    let prefilter_mode = context
+        .settings
+        .get("prefilterMode")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .clamp(0, 2);
+    let prefilter_sharpness = context
+        .settings
+        .get("prefilterSharpness")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .clamp(0, 10);
     let mut lines = vec![
         "v=0".to_owned(),
         "o=unknown 0 14 IN IPv4 127.0.0.1".to_owned(),
@@ -1053,21 +1160,26 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         "a=x-nv-video[0].adaptiveQuantization.perfAdjEnablement:1".to_owned(),
         "a=x-nv-video[0].enableAv1RcPrecisionFactor:1".to_owned(),
         "a=x-nv-video[0].maxNumReferenceFrames:0".to_owned(),
-        // Official's live 4:4:4 session negotiated prefilter Mode 1
-        // (geronimo 20260924 lines 11321/11279); its captured 4:2:0 announce
-        // carried Mode 2 and every OpenNOW session so far sent Mode 0. Mirror
-        // the official request: Mode 1 for 4:4:4, 0 otherwise.
+        // Official's live config carries both DX9 compatibility switches in
+        // every observed session (geronimo 20260924 L12214-12215; they are
+        // also in the captured vendor ANNOUNCE and the Mac baseline), and
+        // OpenNOW never sent them.
+        "a=x-nv-video[0].dx9EnableNv12:1".to_owned(),
+        "a=x-nv-video[0].dx9EnableHdr:1".to_owned(),
+        // Prefilter follows the settings (defaults = the official request:
+        // Mode 1 / sharpness 0, geronimo 20260924 L11168) for every color
+        // quality, as official does; the seat's finalized Mode 2 is not
+        // requested (directive).
         format!(
             "a=x-nv-video[0].prefilterParams.prefilterMode:{}",
-            if params.stream.color_quality.is_444() {
-                1
-            } else {
-                0
-            }
+            prefilter_mode
         ),
         "a=x-nv-video[0].prefilterParams.prefilterModel:4".to_owned(),
         "a=x-nv-video[0].prefilterParams.denoiseLevel:0".to_owned(),
-        "a=x-nv-video[0].prefilterParams.sharpnessLevel:0".to_owned(),
+        format!(
+            "a=x-nv-video[0].prefilterParams.sharpnessLevel:{}",
+            prefilter_sharpness
+        ),
         "a=x-nv-video[0].encoderCscMode:2".to_owned(),
         "a=x-nv-video[0].encoderHdrCscMode:4".to_owned(),
         "a=x-nv-video[0].mapRtpTimestampsToFrames:0".to_owned(),
@@ -1079,10 +1191,12 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         "a=x-nv-vqos[0].fec.rateDropWindow:10".to_owned(),
         "a=x-nv-vqos[0].fec.minRequiredFecPackets:2".to_owned(),
         "a=x-nv-vqos[0].fec.repairPercent:20".to_owned(),
-        "a=x-nv-vqos[0].fec.repairMinPercent:20".to_owned(),
-        "a=x-nv-vqos[0].fec.repairMaxPercent:35".to_owned(),
-        "a=x-nv-vqos[0].bllFec.enable:0".to_owned(),
-        "a=x-nv-vqos[0].grc.enable:7".to_owned(),
+        // Official NvscClientConfig values (directive-verified): repairMin 0,
+        // repairMax 40, bllFec on, grc off.
+        "a=x-nv-vqos[0].fec.repairMinPercent:0".to_owned(),
+        "a=x-nv-vqos[0].fec.repairMaxPercent:40".to_owned(),
+        "a=x-nv-vqos[0].bllFec.enable:1".to_owned(),
+        "a=x-nv-vqos[0].grc.enable:0".to_owned(),
         "a=x-nv-vqos[0].drc.enable:0".to_owned(),
         format!("a=x-nv-vqos[0].dfc.adjustResAndFps:{adjust_res_and_fps}"),
         "a=x-nv-vqos[0].calculateAvgVideoStreamingBitrate:1".to_owned(),
@@ -1094,12 +1208,11 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         "a=x-nv-packetPacing.version:3".to_owned(),
         "a=x-nv-packetPacing.mode:1".to_owned(),
         "a=x-nv-packetPacing.numGroups:5".to_owned(),
-        format!(
-            "a=x-nv-packetPacing.maxDelayUs:{}",
-            if fps >= 100 { 4000 } else { 2000 }
-        ),
+        // Official NvscClientConfig packet pacing (directive-verified):
+        // maxDelayUs 1000 for every frame rate, no minimum group size.
+        "a=x-nv-packetPacing.maxDelayUs:1000".to_owned(),
         "a=x-nv-packetPacing.minNumPacketsFrame:10".to_owned(),
-        "a=x-nv-packetPacing.minNumPacketsPerGroup:15".to_owned(),
+        "a=x-nv-packetPacing.minNumPacketsPerGroup:0".to_owned(),
         "a=x-nv-packetPacing.enableAccurateSleep:1".to_owned(),
         "a=x-nv-packetPacing.enableSmoothTransition:1".to_owned(),
         "a=x-nv-packetPacing.allowFpsBasedToggle:1".to_owned(),
@@ -1166,6 +1279,17 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         lines.push("a=x-nv-mic.micSsrcConfig.senderSsrc:1".to_owned());
     }
     lines.extend(announce_color_lines(params.stream));
+    // The seat's DESCRIBE offer wins for the color/encoder keys it provides,
+    // replacing ours in place and never adding keys we do not emit: official
+    // reads its config from the SDP (geronimo 20260924 L11697 "read 4114
+    // NvscClientConfig attributes from SDP") and the Mac reference applies
+    // the same authority rule.
+    for (key, value) in params.offer {
+        let prefix = format!("a={key}:");
+        if let Some(slot) = lines.iter().position(|line| line.starts_with(&prefix)) {
+            lines[slot] = format!("{prefix}{value}");
+        }
+    }
     lines.extend([
         "t=0 0".to_owned(),
         format!("m=video {}", params.video_port),
@@ -1816,10 +1940,11 @@ mod tests {
                 video_packet_size: 1280,
                 rtcp_on_sctp: true,
                 microphone_available: false,
+                offer: &[],
             },
         );
         assert!(sdp.contains("a=x-nv-video[0].maxFPS:360"));
-        assert!(sdp.contains("a=x-nv-packetPacing.maxDelayUs:4000"));
+        assert!(sdp.contains("a=x-nv-packetPacing.maxDelayUs:1000"));
 
         let mut runaway = context();
         runaway.session.extra["negotiatedStreamProfile"] = json!({"codec":"AV1", "fps":600});
@@ -1838,6 +1963,7 @@ mod tests {
                 video_packet_size: 1280,
                 rtcp_on_sctp: true,
                 microphone_available: false,
+                offer: &[],
             },
         );
         assert!(sdp.contains("a=x-nv-video[0].maxFPS:360"));
@@ -1862,6 +1988,7 @@ mod tests {
                 video_packet_size: 1280,
                 rtcp_on_sctp: true,
                 microphone_available: false,
+                offer: &[],
             },
         );
         assert!(sdp.contains("a=x-nv-video[0].maxFPS:120"));
@@ -1895,6 +2022,7 @@ mod tests {
                     video_packet_size,
                     rtcp_on_sctp: true,
                     microphone_available: false,
+                    offer: &[],
                 },
             );
             assert_eq!(
@@ -1931,6 +2059,7 @@ mod tests {
                 video_packet_size: packet_size,
                 rtcp_on_sctp: true,
                 microphone_available: false,
+                offer: &[],
             },
         );
         assert_eq!(
@@ -1994,6 +2123,7 @@ mod tests {
                     video_packet_size: 1280,
                     rtcp_on_sctp: true,
                     microphone_available: false,
+                    offer: &[],
                 },
             );
             assert!(sdp.contains(&format!("a=x-nv-vqos[0].dynamicStreamingMode:{policy}\r\n")));
@@ -2029,6 +2159,7 @@ mod tests {
                     video_packet_size: 1280,
                     rtcp_on_sctp: true,
                     microphone_available: false,
+                    offer: &[],
                 },
             );
             // HDR carries an explicit :1; SDR omits the line, like the official client.
@@ -2058,6 +2189,7 @@ mod tests {
                 video_packet_size: 1280,
                 rtcp_on_sctp: true,
                 microphone_available: false,
+                offer: &[],
             },
         );
         assert!(sdp.contains("a=x-nv-video[0].initialBitrateKbps:200000"));
@@ -2096,6 +2228,7 @@ mod tests {
                         video_packet_size: 1280,
                         rtcp_on_sctp: true,
                         microphone_available: available,
+                        offer: &[],
                     },
                 );
                 assert_eq!(
@@ -2180,6 +2313,7 @@ mod tests {
                     video_packet_size: 1280,
                     rtcp_on_sctp: true,
                     microphone_available: false,
+                    offer: &[],
                 },
             );
             assert_eq!(
@@ -2214,11 +2348,11 @@ mod tests {
                     "{line} for {codec}/{color}"
                 );
             }
-            // Prefilter Mode follows the official request: 1 for 4:4:4,
-            // 0 otherwise, exactly once in the body.
+            // Prefilter follows the settings; the default (and every test
+            // context) is the official request value 1 for all qualities.
             assert_eq!(
                 sdp_attribute(&sdp, "video[0].prefilterParams.prefilterMode"),
-                Some(if profile_block { "1" } else { "0" }.to_owned())
+                Some("1".to_owned())
             );
             assert_eq!(
                 sdp.matches("a=x-nv-video[0].prefilterParams.prefilterMode:")
@@ -2232,10 +2366,67 @@ mod tests {
                 "a=x-nv-video[0].maxCodecLevel:61",
                 "a=x-nv-video[0].maxH264Profile:3",
                 "a=x-nv-video[0].maxH264Level:61",
+                "a=x-nv-video[0].dx9EnableNv12:1",
+                "a=x-nv-video[0].dx9EnableHdr:1",
             ] {
                 assert!(sdp.contains(line), "{line}");
             }
         }
+    }
+
+    #[test]
+    fn seat_offer_color_values_replace_ours_without_adding_keys() {
+        let mut value = context();
+        value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!("10bit_444");
+        let offer = vec![
+            ("x-nv-video[0].chromaFormat".to_owned(), "3".to_owned()),
+            ("x-nv-video[0].bitDepth".to_owned(), "10".to_owned()),
+            ("x-nv-video[0].notEmitted".to_owned(), "9".to_owned()),
+        ];
+        let sdp = build_announce(
+            &value,
+            AnnounceParams {
+                stream: stream_config(&value),
+                key: &"01".repeat(32),
+                key_id: 7,
+                port: 49006,
+                address: "192.0.2.10",
+                ufrag: "abcd",
+                password: "abcdefghijklmnopqrstuv",
+                fingerprint: "AA:BB",
+                video_port: 5004,
+                video_packet_size: 1280,
+                rtcp_on_sctp: true,
+                microphone_available: false,
+                offer: &offer,
+            },
+        );
+        // Offered values replace ours, exactly once each.
+        assert_eq!(
+            sdp_attribute(&sdp, "video[0].chromaFormat"),
+            Some("3".to_owned())
+        );
+        assert_eq!(sdp.matches("a=x-nv-video[0].chromaFormat:").count(), 1);
+        assert_eq!(
+            sdp_attribute(&sdp, "video[0].bitDepth"),
+            Some("10".to_owned())
+        );
+        // Keys we never emit are never added, even when offered.
+        assert!(!sdp.contains("notEmitted"));
+
+        // The extractor reads the DESCRIBE body for exactly the allowlist.
+        let describe = "a=x-nv-video[0].chromaFormat:3\r\na=x-nv-vqos[0].H265BitStreamProfile:1\r\n\
+                        a=x-nv-video[0].unrelated:7\r\n";
+        assert_eq!(
+            offer_color_overrides(describe),
+            vec![
+                ("x-nv-video[0].chromaFormat".to_owned(), "3".to_owned()),
+                (
+                    "x-nv-vqos[0].H265BitStreamProfile".to_owned(),
+                    "1".to_owned()
+                ),
+            ]
+        );
     }
 
     #[test]

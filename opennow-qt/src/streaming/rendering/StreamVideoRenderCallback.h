@@ -23,6 +23,7 @@ public:
     virtual void setUpscalingTarget(const QSize &) {}
     virtual void setFsrUpscaling(bool) {}
     virtual void setUpscalingEnhancement(int, int) {}
+    virtual void setDownscaleSharpen(bool, int) {}
     virtual bool needsFrame() const { return false; }
     virtual void frameSwapped() {}
     virtual QVariantMap frameGenerationStats() const { return {}; }

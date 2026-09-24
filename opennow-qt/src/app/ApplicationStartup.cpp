@@ -3,6 +3,7 @@
 #include "acceptance/AcceptanceSession.h"
 #include "app/ApplicationStartup.h"
 #include "app/platform/MacAwdlController.h"
+#include "diagnostics/DiagnosticsPaths.h"
 #include "input/ControllerInput.h"
 #include "core/CoreClient.h"
 #include "input/InputModeTracker.h"
@@ -32,6 +33,8 @@
 #include <QQuickWindow>
 #include <QSGRendererInterface>
 #include <QFileOpenEvent>
+#include <QFile>
+#include <QJsonDocument>
 #include <QProcess>
 
 #include <cstdlib>
@@ -69,14 +72,28 @@ private:
 static int runApplicationSession(int argc, char *argv[], QString &restartExecutable)
 {
     qputenv("QT_TLS_BACKEND", "schannel");
-    // Low-latency presentation by default: Qt's D3D swapchain otherwise queues
-    // two frames before Present blocks, which is one extra frame of latency at
-    // the stream cadence (Qt6Gui reads this variable; verified in Qt6Gui.dll).
-    // The launcher's -LowLatencyPresentation exports the same value, and
-    // OPENNOW_PIPELINE_LOW_LATENCY=0 turns the default off without a rebuild.
-    if (qEnvironmentVariableIsEmpty("QT_D3D_MAX_FRAME_LATENCY")
-        && qEnvironmentVariable("OPENNOW_PIPELINE_LOW_LATENCY") != u"0"_s) {
-        qputenv("QT_D3D_MAX_FRAME_LATENCY", "1");
+    // Low-latency presentation, driven by the lowLatencyPresentation setting
+    // (default true, the shipped behaviour): Qt's D3D swapchain otherwise
+    // queues two frames before Present blocks, one extra frame of latency at
+    // the stream cadence (Qt6Gui reads this variable; verified in
+    // Qt6Gui.dll). The launcher's -LowLatencyPresentation and
+    // OPENNOW_PIPELINE_LOW_LATENCY env stay dev overrides that win over the
+    // setting, and an explicit QT_D3D_MAX_FRAME_LATENCY is always respected.
+    if (qEnvironmentVariableIsEmpty("QT_D3D_MAX_FRAME_LATENCY")) {
+        bool lowLatency = true;
+        const auto profileRoot = coreDiagnosticsDataRoot();
+        if (!profileRoot.isEmpty()) {
+            QFile settings(profileRoot + QStringLiteral("/settings.json"));
+            if (settings.open(QIODevice::ReadOnly)) {
+                lowLatency = QJsonDocument::fromJson(settings.readAll())
+                                 .object()
+                                 .value(QStringLiteral("lowLatencyPresentation"))
+                                 .toBool(true);
+            }
+        }
+        const auto overrideValue = qEnvironmentVariable("OPENNOW_PIPELINE_LOW_LATENCY");
+        if (!overrideValue.isEmpty()) lowLatency = overrideValue != u"0"_s;
+        if (lowLatency) qputenv("QT_D3D_MAX_FRAME_LATENCY", "1");
     }
     QElapsedTimer startupTimer;
     startupTimer.start();

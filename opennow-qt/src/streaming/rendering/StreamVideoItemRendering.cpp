@@ -30,6 +30,8 @@ public:
         if (m_callback) m_callback->setFsrUpscaling(m_fsrUpscaling);
         if (m_callback)
             m_callback->setUpscalingEnhancement(item->upscalingSharpness(), item->upscalingDenoise());
+        if (m_callback)
+            m_callback->setDownscaleSharpen(item->downscaleHq(), item->downscaleSharpen());
         markDirty(QSGNode::DirtyGeometry | QSGNode::DirtyMaterial);
     }
 

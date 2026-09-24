@@ -211,6 +211,15 @@ Crowdin and should change only through Crowdin synchronization pull requests.
 - Do not claim completion if a relevant acceptance check fails. Report the failing command and
   failure point.
 
+## Code Search
+
+- Use `tgrep` (trigram-indexed grep) instead of `grep` for code and log searches:
+  `tgrep [-i] [-F] PATTERN [PATH]...`. Fall back to `grep` only for pipes/stdin or if `tgrep`
+  fails.
+- Build or refresh the index from the repo root with
+  `tgrep index . --exclude target --exclude node_modules --exclude .git`. Keep `.tgrep/` out of
+  version control.
+
 ## Development Runtime
 
 - Qt 6.8+, CMake 3.24+, a C++20 toolchain, SDL3, Cargo, and the platform media dependencies are

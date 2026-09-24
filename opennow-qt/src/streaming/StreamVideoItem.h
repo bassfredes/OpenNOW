@@ -46,6 +46,12 @@ class StreamVideoItem : public QQuickItem
                    NOTIFY upscalingSharpnessChanged)
     Q_PROPERTY(int upscalingDenoise READ upscalingDenoise WRITE setUpscalingDenoise
                    NOTIFY upscalingDenoiseChanged)
+    Q_PROPERTY(bool downscaleHq READ downscaleHq WRITE setDownscaleHq
+                   NOTIFY downscaleHqChanged)
+    Q_PROPERTY(int downscaleSharpen READ downscaleSharpen WRITE setDownscaleSharpen
+                   NOTIFY downscaleSharpenChanged)
+    Q_PROPERTY(bool absoluteCursorOnHidden READ absoluteCursorOnHidden
+                   WRITE setAbsoluteCursorOnHidden NOTIFY absoluteCursorOnHiddenChanged)
     Q_PROPERTY(QVariantMap frameGenerationStats READ frameGenerationStats
                    NOTIFY frameGenerationStatsChanged)
     Q_PROPERTY(QVariantMap swapStats READ swapStats NOTIFY swapStatsChanged)
@@ -88,6 +94,12 @@ public:
     void setUpscalingSharpness(int value);
     int upscalingDenoise() const;
     void setUpscalingDenoise(int value);
+    bool downscaleHq() const;
+    void setDownscaleHq(bool enabled);
+    int downscaleSharpen() const;
+    void setDownscaleSharpen(int value);
+    bool absoluteCursorOnHidden() const;
+    void setAbsoluteCursorOnHidden(bool enabled);
     QVariantMap frameGenerationStats() const;
     QVariantMap swapStats() const;
 
@@ -140,6 +152,9 @@ signals:
     void fsrUpscalingChanged();
     void upscalingSharpnessChanged();
     void upscalingDenoiseChanged();
+    void downscaleHqChanged();
+    void downscaleSharpenChanged();
+    void absoluteCursorOnHiddenChanged();
     void frameGenerationStatsChanged();
     void swapStatsChanged();
     void localShortcutRequested(const QString &action);
@@ -207,6 +222,9 @@ private:
     bool m_fsrUpscaling = false;
     int m_upscalingSharpness = 10;
     int m_upscalingDenoise = 0;
+    bool m_downscaleHq = true;
+    int m_downscaleSharpen = 1;
+    bool m_absoluteCursorOnHidden = true;
     QTimer m_frameStatsTimer;
     QTimer m_swapStatsTimer;
     QString m_swapGateSource;

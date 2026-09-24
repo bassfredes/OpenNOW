@@ -37,6 +37,13 @@ const COMMAND_MOUSE_CURSOR_CAPTURE: u16 = 0x0308;
 const COMMAND_TRACK_REMOTE_CURSOR_IMAGE: u16 = 0x030d;
 const COMMAND_WINDOW_STATE: u16 = 0x0320;
 const COMMAND_SYSTEM_STATE: u16 = 0x0321;
+// Server-control mouse settings: the official client's NVB feature type 10
+// (Bifrost2.dll sender RVA 0x2562d0: command 0x0323, eight-byte body = u32 LE
+// speed followed by u32 LE acceleration). The official geronimo logs pin the
+// values at speed=10, accel=0 -> frame 23 03 08 00 0a 00 00 00 00 00 00 00.
+const COMMAND_MOUSE_SETTINGS: u16 = 0x0323;
+const MOUSE_SETTINGS_SPEED: u32 = 10;
+const MOUSE_SETTINGS_ACCEL: u32 = 0;
 
 const INPUT_KEY_DOWN: u32 = 3;
 const INPUT_KEY_UP: u32 = 4;
@@ -1139,8 +1146,8 @@ fn text_keystroke(character: char) -> Option<(u16, u16)> {
     Some((virtual_key, 1))
 }
 
-fn activation_chain(timestamp_us: u64) -> [Vec<u8>; 8] {
-    [
+fn activation_chain(timestamp_us: u64) -> Vec<Vec<u8>> {
+    let mut chain = vec![
         enable_input(1, false),
         device_descriptor(timestamp_us, 0),
         mouse_cursor_capture(true),
@@ -1149,7 +1156,34 @@ fn activation_chain(timestamp_us: u64) -> [Vec<u8>; 8] {
         state_change(COMMAND_SYSTEM_STATE, 0, 0),
         enable_input(1, true),
         haptics_state(true, timestamp_us).bytes,
-    ]
+    ];
+    if mouse_settings_enabled() {
+        // Payload-free record through the diagnostics sink; the frame bytes
+        // themselves never enter the logs.
+        opennow_streamer_protocol::log::log_async(
+            "INFO",
+            "diagnostics",
+            &format!(
+                "cursor tx command={:#06x} speed={MOUSE_SETTINGS_SPEED} accel={MOUSE_SETTINGS_ACCEL}",
+                COMMAND_MOUSE_SETTINGS
+            ),
+        );
+        chain.push(mouse_settings(
+            MOUSE_SETTINGS_SPEED,
+            MOUSE_SETTINGS_ACCEL,
+            mouse_settings_accel_first(),
+        ));
+    }
+    chain
+}
+
+fn mouse_settings_enabled() -> bool {
+    // A/B switch: only an explicit "0" turns the mouse-settings frame off.
+    std::env::var("OPENNOW_MOUSE_SETTINGS").as_deref() != Ok("0")
+}
+
+fn mouse_settings_accel_first() -> bool {
+    std::env::var("OPENNOW_MOUSE_SETTINGS_ORDER").as_deref() == Ok("accel_first")
 }
 
 fn mouse_cursor_capture(enabled: bool) -> Vec<u8> {
@@ -1158,6 +1192,22 @@ fn mouse_cursor_capture(enabled: bool) -> Vec<u8> {
 
 fn remote_cursor_tracking(enabled: bool) -> Vec<u8> {
     control_command(COMMAND_TRACK_REMOTE_CURSOR_IMAGE, &[u8::from(enabled)])
+}
+
+fn mouse_settings(speed: u32, accel: u32, accel_first: bool) -> Vec<u8> {
+    // Bifrost's feature-type-10 sender (RVA 0x2562d0) writes the full u32
+    // argument (speed) first and the byte-range argument (acceleration)
+    // second; `accel_first` exists only for the A/B because the plaintext
+    // capture did not settle which logged value lands in which field.
+    let mut payload = Vec::with_capacity(8);
+    if accel_first {
+        payload.extend_from_slice(&accel.to_le_bytes());
+        payload.extend_from_slice(&speed.to_le_bytes());
+    } else {
+        payload.extend_from_slice(&speed.to_le_bytes());
+        payload.extend_from_slice(&accel.to_le_bytes());
+    }
+    control_command(COMMAND_MOUSE_SETTINGS, &payload)
 }
 
 fn haptics_state(enabled: bool, timestamp_us: u64) -> NvstEncodedInput {
@@ -1520,6 +1570,9 @@ mod tests {
 
     #[test]
     fn control_keepalive_and_activation_are_byte_exact() {
+        let _guard = MOUSE_SETTINGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(control_keepalive(0), hex("0002040000000000"));
         assert_eq!(mouse_cursor_capture(false), hex("0803010000"));
         assert_eq!(mouse_cursor_capture(true), hex("0803010001"));
@@ -1550,6 +1603,64 @@ mod tests {
                 "06022800000000240e000000000000060d0000000100000000000000000000000000000031bc320100000000"
             )
         );
+    }
+
+    static MOUSE_SETTINGS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn mouse_settings_frame_is_byte_exact_speed_first() {
+        assert_eq!(
+            mouse_settings(10, 0, false),
+            hex("230308000a00000000000000")
+        );
+    }
+
+    #[test]
+    fn mouse_settings_frame_is_byte_exact_accel_first() {
+        assert_eq!(
+            mouse_settings(10, 0, true),
+            hex("23030800000000000a000000")
+        );
+    }
+
+    #[test]
+    fn activation_chain_appends_mouse_settings_by_default() {
+        let _guard = MOUSE_SETTINGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: every test that reads or writes these variables holds
+        // MOUSE_SETTINGS_ENV_LOCK, and the suite runs with --test-threads=1.
+        unsafe {
+            std::env::remove_var("OPENNOW_MOUSE_SETTINGS");
+            std::env::remove_var("OPENNOW_MOUSE_SETTINGS_ORDER");
+        }
+        let chain = activation_chain(20_102_193);
+        assert_eq!(chain.len(), 9);
+        assert_eq!(
+            chain[8],
+            hex("230308000a00000000000000"),
+            "default frame is the official speed=10 accel=0, speed first"
+        );
+    }
+
+    #[test]
+    fn activation_chain_omits_mouse_settings_when_disabled() {
+        let _guard = MOUSE_SETTINGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: same serialization contract as
+        // activation_chain_appends_mouse_settings_by_default.
+        unsafe {
+            std::env::set_var("OPENNOW_MOUSE_SETTINGS", "0");
+            std::env::remove_var("OPENNOW_MOUSE_SETTINGS_ORDER");
+        }
+        let chain = activation_chain(20_102_193);
+        unsafe {
+            std::env::remove_var("OPENNOW_MOUSE_SETTINGS");
+        }
+        assert_eq!(chain.len(), 8);
+        assert!(chain.iter().all(|message| !message
+            .starts_with(&COMMAND_MOUSE_SETTINGS.to_le_bytes())));
     }
 
     #[test]

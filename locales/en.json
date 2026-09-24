@@ -189,6 +189,20 @@
     "sdrOnly": "SDR ONLY",
     "summary": " · FSR 1 · clarity %1"
   },
+  "downscale": {
+    "qualityTitle": "Downscale quality",
+    "qualityDescription": "High-quality Lanczos2 downscale with contrast-adaptive sharpening for enlarged video. Off uses a plain box filter.",
+    "sharpenTitle": "Downscale sharpening",
+    "sharpenDescription": "Sharpen strength applied after the high-quality downscale.",
+    "off": "Off",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High"
+  },
+  "reflexSetting": {
+    "title": "Reflex",
+    "description": "Request NVIDIA Reflex low-latency input for the next session"
+  },
   "backgroundStream": {
     "muteTitle": "Mute when out of focus",
     "muteDescription": "Silence stream audio while using another app. Audio returns when you switch back to OpenNOW.",

@@ -247,6 +247,21 @@ impl CloudMatchService {
         crate::requests::check()?;
         session_params["networkTestSessionId"] = json!(network_test["sessionId"].as_str());
         let body = build_create_body(&app_id, &session_params, settings, device_id);
+        // Sanitized copy in the diagnostics log (directive): deviceHashId is
+        // the only secret-adjacent field in the body; tokens/keys live in
+        // headers and never appear here.
+        {
+            let mut logged = body.clone();
+            if let Some(object) = logged["sessionRequestData"].as_object_mut() {
+                if object.contains_key("deviceHashId") {
+                    object.insert(
+                        "deviceHashId".to_owned(),
+                        Value::String("[redacted]".into()),
+                    );
+                }
+            }
+            eprintln!("cloudmatch session-create {}", logged);
+        }
         let mut url = base
             .join("v2/session")
             .map_err(|_| invalid("Invalid CloudMatch session URL"))?;
@@ -326,7 +341,7 @@ impl CloudMatchService {
                 resume["sessionRequestData"]["clientRequestMonitorSettings"][0]["sdrHdrMode"] =
                     json!(hdr_mode);
                 resume["sessionRequestData"]["clientRequestMonitorSettings"][0]["displayData"] =
-                    monitor_display_data(hdr_mode == 1, settings);
+                    monitor_display_data();
                 // Native HDR mode does not enable the separate TrueHDR feature.
                 resume["sessionRequestData"]["requestedStreamingFeatures"]["trueHdr"] =
                     json!(false);
@@ -1319,29 +1334,37 @@ fn build_resume_body(app_id: &str, session: &Value, settings: &Value, device_id:
         "metaData":null, "adUpdates":null})
 }
 
-fn measured_display_luminance(settings: &Value, hdr: bool) -> Option<(f64, f64)> {
-    if !hdr {
-        return None;
-    }
-    crate::streamer::validated_native_hdr_display(&settings["nativeHdrDisplay"])
-}
-
-fn monitor_display_data(hdr: bool, settings: &Value) -> Value {
-    let mut data = json!({
+fn monitor_display_data() -> Value {
+    // Official sends an all-zero displayData inside clientRequestMonitorSettings
+    // even for its HDR session (geronimo 20260924 line 11168: every
+    // displayPrimary*/luminance field is 0 with sdrHdrMode=1); HDR capability
+    // travels separately in clientDisplayHdrCapabilities. Keep the shape
+    // field-for-field and stop injecting measured luminance here.
+    json!({
         "displayPrimaryX0":0,"displayPrimaryY0":0,"displayPrimaryX1":0,"displayPrimaryY1":0,
         "displayPrimaryX2":0,"displayPrimaryY2":0,"displayWhitePointX":0,"displayWhitePointY":0,
-        "desiredContentMaxLuminance":if hdr { 1000 } else { 0 },
+        "desiredContentMaxLuminance":0,
         "desiredContentMinLuminance":0,
-        "desiredContentMaxFrameAverageLuminance":if hdr { 400 } else { 0 }
-    });
-    if let Some((minimum, maximum)) = measured_display_luminance(settings, hdr) {
-        data["desiredContentMaxLuminance"] = json!(maximum);
-        data["desiredContentMinLuminance"] = json!(minimum);
-        if let Some(object) = data.as_object_mut() {
-            object.remove("desiredContentMaxFrameAverageLuminance");
+        "desiredContentMaxFrameAverageLuminance":0
+    })
+}
+
+fn client_display_hdr_capabilities() -> Value {
+    // Verbatim from the official request (geronimo 20260924 line 11168):
+    // version 2, hdrEdrSupportedFlagsInUint32 1, static_metadata_descriptor_id 0,
+    // display_data all zeros. OpenNOW previously sent null.
+    json!({
+        "version":2,
+        "hdrEdrSupportedFlagsInUint32":1,
+        "static_metadata_descriptor_id":0,
+        "display_data":{
+            "displayPrimaryX0":0,"displayPrimaryY0":0,"displayPrimaryX1":0,"displayPrimaryY1":0,
+            "displayPrimaryX2":0,"displayPrimaryY2":0,"displayWhitePointX":0,"displayWhitePointY":0,
+            "desiredContentMaxLuminance":0,
+            "desiredContentMinLuminance":0,
+            "desiredContentMaxFrameAverageLuminance":0
         }
-    }
-    data
+    })
 }
 
 fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: &str) -> Value {
@@ -1372,39 +1395,53 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
         _ => requested_color,
     };
     let cloud_gsync = resolved_cloud_gsync(settings);
-    let reflex = cloud_gsync || fps >= 120;
+    // Directive (verified official request): reflex follows the setting,
+    // default true; the previous cloud-gsync/fps heuristic is gone.
+    let reflex = setting_bool(settings, "enableReflex", true);
     let persistence = setting_bool(settings, "enablePersistingInGameSettings", true)
         && params["supportsInGameSettingsPersistence"].as_bool() == Some(true);
-    // Session metadata, matching the official client: SubSessionId correlates the
-    // allocation, surroundAudioInfo describes the audio layout. No network, signaling,
-    // IME, or resolution hints: none of those keys exist in the official request path.
+    // Session metadata, matching the official request (geronimo 20260924
+    // line 11168): ClientImeSupport, SubSessionId, clientPhysicalResolution,
+    // wssignaling, surroundAudioInfo. networkType is only sent when the
+    // adapter type can be detected (none exists at this layer today, so it
+    // is omitted rather than hardcoded), and official's per-region latency@…
+    // samples are omitted rather than fabricated. The surroundAudioInfo
+    // value stays "2": official sends "6" for its 5.1 output, but OpenNOW
+    // negotiates stereo Opus and claiming 6 could make the seat encode
+    // surround audio this client does not decode.
     let metadata = vec![
+        json!({"key":"ClientImeSupport","value":"0"}),
         json!({"key":"SubSessionId","value":random_uuid()}),
+        json!({"key":"clientPhysicalResolution","value":"{\"horizontalPixels\":1920,\"verticalPixels\":1080}"}),
+        json!({"key":"wssignaling","value":"1"}),
         json!({"key":"surroundAudioInfo","value":"2"}),
     ];
-    // requestedStreamingFeatures, field-for-field with the official Bifrost request
-    // builder: reflex, bitDepth, cloudGsync, enabledL4S, mouseMovementFlags, trueHdr,
-    // supportedHidDevices, profile, fallbackToLogicalResolution, hidDevices,
-    // chromaFormat, prefilterMode/Sharpness/NoiseReduction, hudStreamingMode,
-    // qosPolicy, touchSupport, dlssOverrides. Codec, bitrate ceiling, vsync, channel
-    // count, and the dynamic quality policy are deliberately absent: the official
-    // client resolves the codec locally and carries bitrate/policy purely in the
-    // RTSP ANNOUNCE.
-    // prefilterMode mirrors the official 4:4:4 session request (geronimo
-    // 20260924: client requested Mode 1 and the seat finalized Mode 1,
-    // lines 11168/11279); 4:2:0 keeps 0, which is what every OpenNOW session
-    // has sent so far.
+    // requestedStreamingFeatures, field-for-field with the official request
+    // (geronimo 20260924 line 11168: reflex, bitDepth, cloudGsync,
+    // enabledL4S, mouseMovementFlags, trueHdr, supportedHidDevices, profile,
+    // fallbackToLogicalResolution, hidDevices, chromaFormat,
+    // prefilterMode/Sharpness/NoiseReduction, hudStreamingMode, qosPolicy,
+    // touchSupport, dlssOverrides). Codec, bitrate ceiling, vsync, channel
+    // count, and the dynamic quality policy are deliberately absent: the
+    // official client resolves the codec locally and carries bitrate/policy
+    // purely in the RTSP ANNOUNCE.
+    // enabledL4S defaults to true like the official request; the settings
+    // toggle still wins when the user picks a value.
+    // prefilterMode/prefilterSharpness follow the settings (defaults match
+    // the official request: Mode 1, sharpness 0, geronimo 20260924 L11168;
+    // directive: the server's finalized 2 is not requested) and are sent for
+    // every color quality, as official does.
     let mut features = json!({
         "reflex":reflex,
         "bitDepth":bit_depth,
         "cloudGsync":cloud_gsync,
-        "enabledL4S":setting_bool(settings, "enableL4S", false),
+        "enabledL4S":setting_bool(settings, "enableL4S", true),
         "supportedHidDevices":0,
         "profile":0,
         "fallbackToLogicalResolution":false,
         "chromaFormat":chroma,
-        "prefilterMode":if chroma == 1 { 1 } else { 0 },
-        "prefilterSharpness":0,
+        "prefilterMode":setting_int(settings, "prefilterMode", 1).clamp(0, 2),
+        "prefilterSharpness":setting_int(settings, "prefilterSharpness", 0).clamp(0, 10),
         "prefilterNoiseReduction":0,
         "hudStreamingMode":0
     });
@@ -1421,11 +1458,12 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
     features["dlssOverrides"] = Value::Null;
     json!({"sessionRequestData":{
         "appId":app_id.parse::<i64>().unwrap_or_default(),
+        "externalAppId":Value::Null,
         "internalTitle":params["title"].as_str(),
         "availableSupportedControllers":[2],
         "preferredController":2,
         "networkTestSessionId":params["networkTestSessionId"].as_str(),
-        "parentSessionId":null,
+        "parentSessionId":Value::Null,
         "clientIdentification":"GFN-PC",
         "deviceHashId":device_id,
         "clientVersion":"30.0",
@@ -1436,28 +1474,37 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
             "monitorId":0,"positionX":0,"positionY":0,
             "widthInPixels":width,"heightInPixels":height,"framesPerSecond":fps,
             "sdrHdrMode":if hdr { 1 } else { 0 },
-            "displayData":monitor_display_data(hdr, settings),
-            "hdr10PlusGamingData":null,
-            "dpi":if cfg!(target_os = "macos") { 144 } else { 96 }
+            "displayData":monitor_display_data(),
+            "hdr10PlusGamingData":Value::Null,
+            // Official's only observed monitor dpi is 267 for the 5120x2880
+            // mode (geronimo 20260924 line 11168); other modes keep the
+            // previous value because no other official sample exists.
+            "dpi":if width == 5120 && height == 2880 {
+                267
+            } else if cfg!(target_os = "macos") {
+                144
+            } else {
+                96
+            }
         }],
         "useOps":true,
         "audioMode":2,
         "metaData":metadata,
         "sdrHdrMode":if hdr { 1 } else { 0 },
-        "clientDisplayHdrCapabilities":null,
+        "clientDisplayHdrCapabilities":client_display_hdr_capabilities(),
         "surroundAudioInfo":0,
         "remoteControllersBitmap":0,
         "clientTimezoneOffset":chrono::Local::now().offset().utc_minus_local() * 1000,
         "enhancedStreamMode":0,
         "appLaunchMode":app_launch_mode(params),
         "secureRTSPSupported":true,
-        "partnerCustomData":null,
+        "partnerCustomData":Value::Null,
         "accountLinked":params["accountLinked"].as_bool().unwrap_or(false),
         "enablePersistingInGameSettings":persistence,
         "requestedAudioFormat":0,
         "userAge":25,
         "requestedStreamingFeatures":features,
-        "transport":null
+        "transport":Value::Null
     }})
 }
 
@@ -2475,6 +2522,10 @@ fn setting_string(settings: &Value, key: &str, fallback: &str) -> String {
 
 fn setting_bool(settings: &Value, key: &str, fallback: bool) -> bool {
     settings[key].as_bool().unwrap_or(fallback)
+}
+
+fn setting_int(settings: &Value, key: &str, fallback: i64) -> i64 {
+    settings[key].as_i64().unwrap_or(fallback)
 }
 
 fn resolved_cloud_gsync(settings: &Value) -> bool {
@@ -3945,9 +3996,10 @@ mod tests {
         assert_eq!(request["requestedStreamingFeatures"]["trueHdr"], false);
         assert_eq!(request["requestedStreamingFeatures"]["bitDepth"], 1);
         assert_eq!(request["requestedStreamingFeatures"]["chromaFormat"], 0);
+        // Official sends all-zero monitor displayData even for HDR sessions.
         let display_data = &request["clientRequestMonitorSettings"][0]["displayData"];
-        assert_eq!(display_data["desiredContentMaxLuminance"], 1000);
-        assert_eq!(display_data["desiredContentMaxFrameAverageLuminance"], 400);
+        assert_eq!(display_data["desiredContentMaxLuminance"], 0);
+        assert_eq!(display_data["desiredContentMaxFrameAverageLuminance"], 0);
         assert_eq!(display_data["desiredContentMinLuminance"], 0);
         for settings in [
             json!({}),
@@ -3971,7 +4023,10 @@ mod tests {
     }
 
     #[test]
-    fn validated_display_luminance_replaces_requested_content_defaults() {
+    fn measured_display_luminance_never_reaches_the_official_zero_display_data() {
+        // Official's monitor displayData is all zeros (geronimo 20260924
+        // L11168); measured native-HDR luminance stays a settings-level fact
+        // and no longer leaks into the CloudMatch body.
         let capabilities = json!({"protocolVersion":7,"nativeHdrSupported":true,"videoBackends":[{
             "backend":"vaapi","available":true,"codecs":[
                 {"codec":"h265","available":true,"colorQualities":["8bit_420","10bit_420"]}
@@ -3985,13 +4040,9 @@ mod tests {
         let body = build_create_body("123", &json!({}), &settings, "device");
         let display_data =
             &body["sessionRequestData"]["clientRequestMonitorSettings"][0]["displayData"];
-        assert_eq!(display_data["desiredContentMaxLuminance"], 620.0);
-        assert_eq!(display_data["desiredContentMinLuminance"], 0.005);
-        assert!(
-            display_data
-                .get("desiredContentMaxFrameAverageLuminance")
-                .is_none()
-        );
+        assert_eq!(display_data["desiredContentMaxLuminance"], 0);
+        assert_eq!(display_data["desiredContentMinLuminance"], 0);
+        assert_eq!(display_data["desiredContentMaxFrameAverageLuminance"], 0);
         assert_eq!(display_data["displayPrimaryX0"], 0);
         assert_eq!(display_data["displayWhitePointY"], 0);
         assert_eq!(body["sessionRequestData"]["sdrHdrMode"], 1);
@@ -4008,7 +4059,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_display_luminance_keeps_documented_defaults() {
+    fn malformed_display_luminance_keeps_the_official_zero_display_data() {
         for display in [
             json!({"minimumNits":600.0,"maximumNits":400.0}),
             json!({"minimumNits":-1.0,"maximumNits":400.0}),
@@ -4022,9 +4073,9 @@ mod tests {
             let body = build_create_body("123", &json!({}), &settings, "device");
             let display_data =
                 &body["sessionRequestData"]["clientRequestMonitorSettings"][0]["displayData"];
-            assert_eq!(display_data["desiredContentMaxLuminance"], 1000);
+            assert_eq!(display_data["desiredContentMaxLuminance"], 0);
             assert_eq!(display_data["desiredContentMinLuminance"], 0);
-            assert_eq!(display_data["desiredContentMaxFrameAverageLuminance"], 400);
+            assert_eq!(display_data["desiredContentMaxFrameAverageLuminance"], 0);
         }
     }
 
@@ -4089,9 +4140,9 @@ mod tests {
         let body = build_create_body("123", &json!({}), &resolved, "device");
         let display_data =
             &body["sessionRequestData"]["clientRequestMonitorSettings"][0]["displayData"];
-        assert_eq!(display_data["desiredContentMaxLuminance"], 1000);
+        assert_eq!(display_data["desiredContentMaxLuminance"], 0);
         assert_eq!(display_data["desiredContentMinLuminance"], 0);
-        assert_eq!(display_data["desiredContentMaxFrameAverageLuminance"], 400);
+        assert_eq!(display_data["desiredContentMaxFrameAverageLuminance"], 0);
         for invalid in [
             json!({"minimumNits":620,"maximumNits":620}),
             json!({"minimumNits":0.005,"maximumNits":10001}),
@@ -4106,9 +4157,9 @@ mod tests {
             let body = build_create_body("123", &json!({}), &stale, "device");
             let display_data =
                 &body["sessionRequestData"]["clientRequestMonitorSettings"][0]["displayData"];
-            assert_eq!(display_data["desiredContentMaxLuminance"], 1000);
+            assert_eq!(display_data["desiredContentMaxLuminance"], 0);
             assert_eq!(display_data["desiredContentMinLuminance"], 0);
-            assert_eq!(display_data["desiredContentMaxFrameAverageLuminance"], 400);
+            assert_eq!(display_data["desiredContentMaxFrameAverageLuminance"], 0);
         }
         let migrated = crate::streamer::StreamerService::embedded_session_settings(
             &previous,
@@ -4118,13 +4169,9 @@ mod tests {
         let body = build_create_body("123", &json!({}), &migrated, "device");
         let display_data =
             &body["sessionRequestData"]["clientRequestMonitorSettings"][0]["displayData"];
-        assert_eq!(display_data["desiredContentMaxLuminance"], 400.0);
-        assert_eq!(display_data["desiredContentMinLuminance"], 0.0005);
-        assert!(
-            display_data
-                .get("desiredContentMaxFrameAverageLuminance")
-                .is_none()
-        );
+        assert_eq!(display_data["desiredContentMaxLuminance"], 0);
+        assert_eq!(display_data["desiredContentMinLuminance"], 0);
+        assert_eq!(display_data["desiredContentMaxFrameAverageLuminance"], 0);
         let resume = build_resume_body(
             "123",
             &json!({"sessionId":"s","status":2,
@@ -4132,6 +4179,8 @@ mod tests {
             &resolved,
             "device",
         );
+        // Resume omits monitor geometry entirely for this payload, so no
+        // displayData (and therefore no desiredContent key) can leak through.
         assert!(resume.to_string().find("desiredContent").is_none());
     }
 
@@ -4310,12 +4359,19 @@ mod tests {
                 .get("maxBitrateKbps")
                 .is_none()
         );
-        assert!(request.get("externalAppId").is_none());
+        assert!(request["externalAppId"].is_null());
         assert_eq!(request["enablePersistingInGameSettings"], true);
         assert_eq!(request["internalTitle"], "Portal 2");
         assert_eq!(request["accountLinked"], true);
         assert_eq!(request["appLaunchMode"], 2);
         assert_eq!(request["secureRTSPSupported"], true);
+        // Official request fields (geronimo 20260924 L11168).
+        assert_eq!(request["userAge"], 25);
+        assert_eq!(request["clientDisplayHdrCapabilities"]["version"], 2);
+        assert_eq!(
+            request["clientDisplayHdrCapabilities"]["hdrEdrSupportedFlagsInUint32"],
+            1
+        );
         assert!(
             request["metaData"]
                 .as_array()
@@ -4373,7 +4429,19 @@ mod tests {
             .map(|entry| entry["key"].as_str().unwrap())
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["SubSessionId", "surroundAudioInfo"]);
+        // Field set follows the official request (geronimo 20260924 L11168);
+        // surroundAudioInfo stays "2" (stereo, see the builder comment) and
+        // official's latency@… region samples are not fabricated.
+        assert_eq!(
+            keys,
+            [
+                "ClientImeSupport",
+                "SubSessionId",
+                "clientPhysicalResolution",
+                "surroundAudioInfo",
+                "wssignaling"
+            ]
+        );
     }
 
     #[test]
@@ -4409,12 +4477,34 @@ mod tests {
         assert!(features.get("audioChannelCount").is_none());
         assert!(features.get("vsync").is_none());
         // Official request fields (geronimo 20260924 line 11168): qosPolicy 0,
-        // touchSupport false, dlssOverrides null, prefilterMode 1 for a 4:4:4
-        // session.
+        // touchSupport false, dlssOverrides null, enabledL4S true,
+        // prefilterMode 1 / sharpness 0 (settings-driven, official defaults).
         assert_eq!(features["qosPolicy"], 0);
         assert_eq!(features["touchSupport"], false);
         assert!(features["dlssOverrides"].is_null());
+        assert_eq!(features["enabledL4S"], true);
         assert_eq!(features["prefilterMode"], 1);
+        assert_eq!(features["prefilterSharpness"], 0);
+        // 2560x1440 keeps the legacy dpi; only 5120x2880 maps to 267.
+        assert_eq!(
+            body["sessionRequestData"]["clientRequestMonitorSettings"][0]["dpi"],
+            96
+        );
+    }
+
+    #[test]
+    fn five_k_mode_requests_the_official_monitor_dpi() {
+        let body = build_create_body(
+            "12345",
+            &json!({}),
+            &json!({"resolution": "5120x2880", "fps": 120}),
+            "device-id",
+        );
+        let monitor = &body["sessionRequestData"]["clientRequestMonitorSettings"][0];
+        assert_eq!(monitor["widthInPixels"], 5120);
+        assert_eq!(monitor["heightInPixels"], 2880);
+        // The only official dpi sample (geronimo 20260924 line 11168).
+        assert_eq!(monitor["dpi"], 267);
     }
 
     #[test]

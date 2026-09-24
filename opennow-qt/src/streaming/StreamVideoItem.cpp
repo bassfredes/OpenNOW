@@ -339,6 +339,45 @@ void StreamVideoItem::setFsrUpscaling(bool enabled)
     update();
 }
 
+bool StreamVideoItem::downscaleHq() const
+{
+    return m_downscaleHq;
+}
+
+void StreamVideoItem::setDownscaleHq(bool enabled)
+{
+    if (m_downscaleHq == enabled) return;
+    m_downscaleHq = enabled;
+    emit downscaleHqChanged();
+    update();
+}
+
+int StreamVideoItem::downscaleSharpen() const
+{
+    return m_downscaleSharpen;
+}
+
+void StreamVideoItem::setDownscaleSharpen(int value)
+{
+    value = qBound(0, value, 3);
+    if (m_downscaleSharpen == value) return;
+    m_downscaleSharpen = value;
+    emit downscaleSharpenChanged();
+    update();
+}
+
+bool StreamVideoItem::absoluteCursorOnHidden() const
+{
+    return m_absoluteCursorOnHidden;
+}
+
+void StreamVideoItem::setAbsoluteCursorOnHidden(bool enabled)
+{
+    if (m_absoluteCursorOnHidden == enabled) return;
+    m_absoluteCursorOnHidden = enabled;
+    emit absoluteCursorOnHiddenChanged();
+}
+
 void StreamVideoItem::connectFrameSwaps()
 {
     disconnect(m_frameSwapConnection);

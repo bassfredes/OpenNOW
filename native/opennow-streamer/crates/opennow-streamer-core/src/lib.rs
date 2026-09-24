@@ -826,6 +826,7 @@ impl Engine {
 
         let mut nvst_events = None;
         let mut nvst_resources = None;
+        let mut input_wake_sender: Option<Sender<NvstReceiveEvent>> = None;
         if let Some(config) = nvst_config {
             let Some(media_consumer) = self.media_consumer.clone() else {
                 self.stop_media_resources();
@@ -836,6 +837,9 @@ impl Engine {
                 ));
             };
             let (event_sender, event_receiver) = std::sync::mpsc::channel();
+            // Kept separately from event_sender (which is moved into the
+            // receiver/mjolnir spawns below) to install the input-queue waker.
+            input_wake_sender = Some(event_sender.clone());
             let (reserved_socket, reserved_rtc, reserved_mjolnir) =
                 match self.reserved_nvst_bundle.take() {
                     Some(bundle) => {
@@ -956,6 +960,14 @@ impl Engine {
                 .media_session
                 .as_ref()
                 .map(MediaSession::captured_input);
+            if let (Some(queue), Some(sender)) = (captured_input.as_ref(), input_wake_sender.take())
+            {
+                // A push now wakes this loop's recv_timeout immediately
+                // instead of waiting out the 250us poll floor.
+                queue.set_waker(move || {
+                    let _ = sender.send(NvstReceiveEvent::InputQueued);
+                });
+            }
             let shortcut_runtime = self.media_runtime.clone();
             let start_id = command.id.clone();
             let nvst_resources = nvst_resources.expect("NVST events require active resources");
@@ -2004,6 +2016,7 @@ fn forward_nvst_event<R: NvstSessionResources>(
     }
 
     match nvst_event {
+        NvstReceiveEvent::InputQueued => false,
         NvstReceiveEvent::MicrophoneError(message) => {
             opennow_streamer_protocol::log::log_line("WARN", "microphone", &message);
             false

@@ -138,6 +138,36 @@ Column {
             }
         }
         DesktopSettingsRow {
+            objectName: "downscaleQualityRow"
+            width: parent.width; paperStyle: true; glyph: "monitor"; title: qsTr("Downscale quality")
+            description: qsTr("High-quality Lanczos2 downscale with contrast-adaptive sharpening for enlarged video. Off uses a plain box filter.")
+            DesktopSettingsSegmented {
+                objectName: "downscaleQualitySelector"
+                readonly property bool current: page.settingsScreen.valueSetting("downscaleHq", true) !== false
+                options: [{label: qsTr("Off"), value: false}, {label: qsTr("High"), value: true}]
+                selectedIndex: current ? 1 : 0
+                optionWidth: 90
+                onSelected: (index, item) => page.settingsScreen.setSetting("downscaleHq", item.value)
+            }
+        }
+        DesktopSettingsRow {
+            objectName: "downscaleSharpenRow"
+            width: parent.width; paperStyle: true; glyph: "sun"; title: qsTr("Downscale sharpening")
+            description: qsTr("Sharpen strength applied after the high-quality downscale.")
+            DesktopSettingsSegmented {
+                objectName: "downscaleSharpenSelector"
+                readonly property string current: String(page.settingsScreen.valueSetting("downscaleSharpen", "low"))
+                options: [
+                    {label: qsTr("Off"), value: "off"},
+                    {label: qsTr("Low"), value: "low"},
+                    {label: qsTr("Medium"), value: "medium"},
+                    {label: qsTr("High"), value: "high"}
+                ]
+                selectedIndex: Math.max(0, options.findIndex(item => item.value === current))
+                onSelected: (index, item) => page.settingsScreen.setSetting("downscaleSharpen", item.value)
+            }
+        }
+        DesktopSettingsRow {
             width: parent.width; paperStyle: true; glyph: "speed"; title: qsTr("Frame generation (Experimental)")
             description: qsTr("Targets 120 displayed FPS from a 60 FPS stream. Requires a fast GPU and 120 Hz display; adds latency and artifacts.")
             DesktopSettingsSegmented {

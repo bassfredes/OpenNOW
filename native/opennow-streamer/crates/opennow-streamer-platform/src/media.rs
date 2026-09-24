@@ -521,13 +521,33 @@ pub struct CapturedInputSample {
     pub captured_at: Instant,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct CapturedInputQueue {
     pending: Mutex<VecDeque<CapturedInputSample>>,
     overflowed: AtomicBool,
     text_ready: AtomicBool,
     text_generation: AtomicU64,
     text_slot: opennow_streamer_protocol::text_input::TextInputSlot,
+    /// Installed by the session layer so a fresh push wakes the consumer's
+    /// event channel immediately instead of waiting out its poll interval.
+    waker: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for CapturedInputQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedInputQueue")
+            .field(
+                "pending",
+                &self
+                    .pending
+                    .lock()
+                    .map(|pending| pending.len())
+                    .unwrap_or(usize::MAX),
+            )
+            .field("overflowed", &self.overflowed.load(Ordering::Relaxed))
+            .field("text_ready", &self.text_ready.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl CapturedInputQueue {
@@ -616,6 +636,28 @@ impl CapturedInputQueue {
             }
         }
         pending.push_back(sample);
+        drop(pending);
+        // Wake the consumer immediately: without this a pushed sample waits
+        // out the session loop's poll interval (measured submitToEnqueue p50
+        // 0.52 ms / p95 1.4 ms on the live build).
+        if let Some(waker) = self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            waker();
+        }
+    }
+
+    /// Installs (or replaces) the wake callback invoked after each successful
+    /// push. Session start installs one; a stale callback from a previous
+    /// session only sends into a disconnected channel, which is harmless.
+    pub fn set_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
+        *self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(waker));
     }
 
     pub(crate) fn release_gamepad(&self, controller_id: u8, bitmap: u16) {

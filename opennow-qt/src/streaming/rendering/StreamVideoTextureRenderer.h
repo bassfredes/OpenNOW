@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <optional>
 
 // Render-thread owner for imported video textures and the scene-graph material.
 // Each QRhi slot keeps its own import/bindings; rotating slots must not recreate
@@ -51,9 +52,48 @@ public:
             }
         }
         m_composition[25] = m_outputBits == 8 ? 1.0f / 255.0f : 0.0f;
+        // Downscale flags from the settings-driven setter; the environment
+        // variables act as dev overrides (env wins when set):
+        // OPENNOW_DOWNSCALE_HQ=0 falls back to the plain box prefilter and
+        // OPENNOW_DOWNSCALE_SHARPEN=off|low|med|high picks the strength.
+        m_composition[32] = m_downscaleHq ? 1.0f : 0.0f;
+        m_composition[33] = m_downscaleSharpen;
+        m_composition[34] = 0.0f;
+        m_composition[35] = 0.0f;
+        static const std::optional<float> envHq = []() -> std::optional<float> {
+            const auto value = qEnvironmentVariable("OPENNOW_DOWNSCALE_HQ");
+            if (value.isEmpty()) return std::nullopt;
+            return (value == QStringLiteral("0") || value == QStringLiteral("off"))
+                ? 0.0f
+                : 1.0f;
+        }();
+        static const std::optional<float> envSharpen = []() -> std::optional<float> {
+            const auto value = qEnvironmentVariable("OPENNOW_DOWNSCALE_SHARPEN");
+            if (value.isEmpty()) return std::nullopt;
+            const auto lowered = value.toLower();
+            if (lowered == QStringLiteral("off") || lowered == QStringLiteral("0"))
+                return 0.0f;
+            if (lowered == QStringLiteral("med") || lowered == QStringLiteral("medium")
+                || lowered == QStringLiteral("2"))
+                return 0.30f;
+            if (lowered == QStringLiteral("high") || lowered == QStringLiteral("3"))
+                return 0.45f;
+            return 0.15f;
+        }();
+        if (envHq) m_composition[32] = *envHq;
+        if (envSharpen) m_composition[33] = *envSharpen;
     }
 
     int outputBits() const { return m_outputBits; }
+
+    // Settings-driven downscale quality: HQ enables the footprint-scaled
+    // Lanczos2 kernel plus the CAS-style sharpen (strength 0..0.45); false
+    // selects the plain box prefilter. Applied on the next initialize pass.
+    void setDownscaleSharpen(bool hq, float sharpen)
+    {
+        m_downscaleHq = hq;
+        m_downscaleSharpen = qBound(0.0f, sharpen, 1.0f);
+    }
 
     void setComposition(const QMatrix4x4 &matrix, const QRectF &bounds,
                         const QRectF &video, float opacity)
@@ -73,7 +113,7 @@ public:
     bool prepare(QRhiCommandBuffer *cb)
     {
         if (!m_uniforms) {
-            m_uniforms.reset(m_rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, 128));
+            m_uniforms.reset(m_rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, 144));
             if (!m_uniforms->create()) { m_uniforms.reset(); return false; }
         }
         if (!m_sampler) {
@@ -83,7 +123,7 @@ public:
             if (!m_sampler->create()) { m_sampler.reset(); return false; }
         }
         auto *updates = m_rhi->nextResourceUpdateBatch();
-        updates->updateDynamicBuffer(m_uniforms.get(), 0, 128, m_composition.data());
+        updates->updateDynamicBuffer(m_uniforms.get(), 0, 144, m_composition.data());
         cb->resourceUpdate(updates);
         ensurePipelines();
         return !m_imports[m_currentSlot].bindings || (m_pipelines[0] && m_pipelines[1]);
@@ -332,10 +372,12 @@ private:
     QRhiTexture *m_fsrOutput = nullptr;
     float m_texelWidth = 0.0f;
     float m_texelHeight = 0.0f;
+    bool m_downscaleHq = true;
+    float m_downscaleSharpen = 0.15f;
     std::array<std::unique_ptr<QRhiGraphicsPipeline>, 2> m_pipelines;
     std::unique_ptr<QRhiSampler> m_sampler;
     std::unique_ptr<QRhiBuffer> m_uniforms;
-    std::array<float, 32> m_composition{};
+    std::array<float, 36> m_composition{};
     QVector<quint32> m_passFormat;
     size_t m_currentSlot = 0;
     int m_externalSlot = -1;

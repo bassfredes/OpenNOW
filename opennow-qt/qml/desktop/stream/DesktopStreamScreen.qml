@@ -103,6 +103,9 @@ FocusScope {
         fsrUpscaling: Qt.platform.os !== "osx" && ShellStore.settings.upscaling === "fsr1"
         upscalingSharpness: Number(ShellStore.settings.upscalingSharpness ?? 10)
         upscalingDenoise: Number(ShellStore.settings.upscalingDenoise ?? 0)
+        downscaleHq: ShellStore.settings.downscaleHq !== false
+        downscaleSharpen: Math.max(0, ["off", "low", "medium", "high"].indexOf(String(ShellStore.settings.downscaleSharpen ?? "low")))
+        absoluteCursorOnHidden: ShellStore.settings.absoluteCursorOnHidden !== false
         z: 0
         onLocalShortcutRequested: action => ShellStore.applyStreamShortcutAction(action)
         onClipboardPasteFailed: clipboardPasteNotice.restart()

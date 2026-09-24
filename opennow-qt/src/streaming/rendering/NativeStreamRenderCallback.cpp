@@ -16,6 +16,7 @@
 
 #include <utility>
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 
 namespace {
@@ -161,6 +162,12 @@ public:
         }
         const auto output = HdrOutput::renderState();
         m_textures.setColorSpace(m_sourceColorSpace, output.mode, output.whiteNits, output.supported);
+        {
+            // off / low / medium / high -> shader strength
+            static const float strengths[] = {0.0f, 0.15f, 0.30f, 0.45f};
+            const auto index = std::clamp(m_downscaleSharpen, 0, 3);
+            m_textures.setDownscaleSharpen(m_downscaleHq, strengths[index]);
+        }
         if (!m_textures.prepare(commandBuffer)) {
             reportFailure(QStringLiteral("Could not create the video shaders or GPU resources. Check the packaged shaders and GPU driver."));
             return;
@@ -345,6 +352,12 @@ public:
     void setFsrUpscaling(bool enabled) override
     {
         m_fsrUpscaling = enabled;
+    }
+
+    void setDownscaleSharpen(bool hq, int sharpen) override
+    {
+        m_downscaleHq = hq;
+        m_downscaleSharpen = sharpen;
     }
 
     void setUpscalingEnhancement(int sharpness, int denoise) override
@@ -550,6 +563,8 @@ private:
     bool m_fsrUpscaling = false;
     int m_upscalingSharpness = 10;
     int m_upscalingDenoise = 0;
+    bool m_downscaleHq = true;
+    int m_downscaleSharpen = 1;
     bool m_frameGenerationFailed = false;
     bool m_resetFrameGeneration = false;
     bool m_outputDirty = false;

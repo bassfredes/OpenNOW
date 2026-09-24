@@ -1824,6 +1824,10 @@ pub enum NvstReceiveEvent {
     Frame(EncodedVideoAccessUnit),
     TransportReady(&'static str),
     InputReady(u16),
+    /// Wake-only: a captured-input push arrived on the shared queue. The
+    /// session loop drains the queue at the top of the next iteration; this
+    /// variant carries no payload and is otherwise ignored.
+    InputQueued,
     InputUnavailable(String),
     MicrophoneError(String),
     Cursor(Vec<u8>),
@@ -4498,6 +4502,36 @@ enum UdpReceiverCommand {
     Stop,
 }
 
+/// Loopback wake for the receive worker: the worker blocks in recv_from and
+/// a queued input command cannot interrupt that wait, so the control sends a
+/// one-byte datagram to the worker's own bound port after enqueueing. The
+/// worker sees a foreign source address, skips to the top of the loop, and
+/// drains the command queue in microseconds instead of waiting out the
+/// receive timeout (live enqueueToWorker p95 was ~1.0 ms, max 11 ms).
+struct InputWake {
+    socket: UdpSocket,
+    target: SocketAddr,
+}
+
+impl InputWake {
+    fn send(&self) {
+        let _ = self.socket.send_to(&[0_u8], self.target);
+    }
+}
+
+fn make_input_wake(target: &UdpSocket) -> Option<Arc<InputWake>> {
+    let bound = target.local_addr().ok()?;
+    let loopback = match bound.ip() {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    let socket = UdpSocket::bind(SocketAddr::new(loopback, 0)).ok()?;
+    Some(Arc::new(InputWake {
+        socket,
+        target: SocketAddr::new(loopback, bound.port()),
+    }))
+}
+
 /// Owns the bounded UDP receive worker. Frames go through the same bounded `MediaConsumer` used
 /// by WebRTC, so a slow decoder cannot make UDP receive unbounded.
 pub struct NvstUdpReceiverSession {
@@ -4505,6 +4539,7 @@ pub struct NvstUdpReceiverSession {
     join: Option<JoinHandle<()>>,
     input_ready: Arc<AtomicBool>,
     microphone: Arc<Mutex<MicrophoneQueue>>,
+    wake: Option<Arc<InputWake>>,
 }
 
 #[derive(Clone)]
@@ -4512,6 +4547,7 @@ pub struct NvstUdpReceiverControl {
     commands: Sender<UdpReceiverCommand>,
     input_ready: Arc<AtomicBool>,
     microphone: Arc<Mutex<MicrophoneQueue>>,
+    wake: Option<Arc<InputWake>>,
 }
 
 #[derive(Debug, Error)]
@@ -4540,6 +4576,7 @@ impl NvstUdpReceiverSession {
             commands: self.commands.clone(),
             input_ready: Arc::clone(&self.input_ready),
             microphone: Arc::clone(&self.microphone),
+            wake: self.wake.clone(),
         }
     }
 
@@ -4639,6 +4676,9 @@ impl NvstUdpReceiverControl {
                 reply: Some(reply),
             })
             .map_err(|_| TransportError::Closed)?;
+        if let Some(wake) = &self.wake {
+            wake.send();
+        }
         result
             .recv_timeout(Duration::from_millis(500))
             .map_err(|_| TransportError::Closed)?
@@ -4664,7 +4704,11 @@ impl NvstUdpReceiverControl {
                 queued_at: Some(Instant::now()),
                 reply: None,
             })
-            .map_err(|_| TransportError::Closed)
+            .map_err(|_| TransportError::Closed)?;
+        if let Some(wake) = &self.wake {
+            wake.send();
+        }
+        Ok(())
     }
 
     pub fn stop(&self) -> Result<(), NvstUdpReceiverError> {
@@ -5007,8 +5051,57 @@ fn bind_nvst_udp_socket(bind_ip: IpAddr, port: u16) -> std::io::Result<UdpSocket
             socket.recv_buffer_size().unwrap_or(0)
         ),
     );
+    if bind_ip.is_ipv4() {
+        configure_ect_marking(&socket);
+    }
     Ok(socket.into())
 }
+
+/// Best-effort ECT(1) marking on the NVST IPv4 UDP sockets, matching the
+/// official session's ECN configuration (`vqos.enableEcn: 1`,
+/// `EcnEctCodepoint: 1`, geronimo 20260924 L12632/L12634): L4S bottlenecks
+/// keep short queues for ECT-marked traffic, which is the uplink queueing
+/// delay our input/control packets ride behind. Windows may filter TOS bits
+/// for unprivileged processes, so the value is read back and the outcome is
+/// logged instead of assumed. Downlink CE echo feedback is NOT implemented:
+/// str0m has no ECN/RTCP feedback support, so `l4sHandling.enableEcnFeedback`
+/// is deliberately never announced (it is also absent from the captured
+/// official ANNOUNCE).
+#[cfg(target_os = "windows")]
+fn configure_ect_marking(socket: &Socket) {
+    use std::mem::size_of_val;
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{IP_TOS, IPPROTO_IP, getsockopt, setsockopt};
+    const ECT1: i32 = 0x02; // DSCP 0, ECN field 0b10 (ECT(1))
+    let requested: i32 = ECT1;
+    // SAFETY: socket is live; the i32 stays valid for the synchronous calls.
+    unsafe {
+        setsockopt(
+            socket.as_raw_socket() as _,
+            IPPROTO_IP,
+            IP_TOS,
+            (&requested as *const i32).cast(),
+            size_of_val(&requested) as i32,
+        );
+        let mut actual: i32 = 0;
+        let mut length = size_of_val(&actual) as i32;
+        getsockopt(
+            socket.as_raw_socket() as _,
+            IPPROTO_IP,
+            IP_TOS,
+            (&mut actual as *mut i32).cast(),
+            &mut length,
+        );
+        opennow_streamer_protocol::log::log_line(
+            "INFO",
+            "nvst-udp",
+            &format!("ect-marking requested={ECT1} actual={actual}"),
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_ect_marking(_socket: &Socket) {}
 
 #[cfg(windows)]
 fn set_exclusive_udp_address(socket: &Socket) -> std::io::Result<()> {
@@ -5297,6 +5390,7 @@ fn spawn_receiver_thread(
     socket
         .set_read_timeout(Some(UDP_RECEIVE_POLL_INTERVAL))
         .map_err(NvstUdpReceiverError::Configure)?;
+    let wake = make_input_wake(&socket);
     let (commands, receiver) = mpsc::channel();
     let input_ready = Arc::new(AtomicBool::new(false));
     let worker_input_ready = input_ready.clone();
@@ -5344,6 +5438,7 @@ fn spawn_receiver_thread(
         join: Some(join),
         input_ready,
         microphone,
+        wake,
     })
 }
 
@@ -7288,6 +7383,7 @@ mod tests {
         let control = super::NvstUdpReceiverControl {
             commands,
             input_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wake: None,
             microphone: std::sync::Arc::new(std::sync::Mutex::new(super::MicrophoneQueue::new(
                 false,
             ))),
@@ -10860,6 +10956,24 @@ mod tests {
         assert!(frame.keyframe);
         video_session.stop();
         bundle_session.stop();
+    }
+
+    #[test]
+    fn input_wake_datagram_reaches_the_worker_bound_port() {
+        // The worker socket stands in for the bundle port; after queue_input
+        // the control's wake byte must arrive so recv_from returns at once.
+        let worker = UdpSocket::bind("127.0.0.1:0").expect("worker socket");
+        worker
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("worker timeout");
+        let wake = make_input_wake(&worker).expect("wake pair");
+        wake.send();
+        let mut buffer = [0_u8; 1];
+        worker.recv_from(&mut buffer).expect("wake datagram");
+        assert_eq!(buffer, [0]);
+        // The datagram's source is not the peer, so the worker's existing
+        // `source != bundle_peer` check skips straight back to the command
+        // drain at the top of the loop.
     }
 
     #[test]

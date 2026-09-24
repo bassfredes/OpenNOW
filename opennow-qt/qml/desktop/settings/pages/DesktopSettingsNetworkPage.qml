@@ -69,7 +69,13 @@ Column {
             DesktopSettingsRow {
                 width: parent.width; paperStyle: true; glyph: "bolt"; title: qsTr("L4S")
                 description: qsTr("Request scalable low-latency transport for the next session")
-                DesktopSettingsToggle { checked: page.settingsScreen.boolSetting("enableL4S",false); onValueChangedByUser: value => page.settingsScreen.setSetting("enableL4S",value) }
+                DesktopSettingsToggle { checked: page.settingsScreen.boolSetting("enableL4S",true); onValueChangedByUser: value => page.settingsScreen.setSetting("enableL4S",value) }
+            }
+            DesktopSettingsRow {
+                objectName: "reflexRow"
+                width: parent.width; paperStyle: true; glyph: "zap"; title: qsTr("Reflex")
+                description: qsTr("Request NVIDIA Reflex low-latency input for the next session")
+                DesktopSettingsToggle { checked: page.settingsScreen.boolSetting("enableReflex",true); onValueChangedByUser: value => page.settingsScreen.setSetting("enableReflex",value) }
             }
             DesktopSettingsRow {
                 objectName: "renewNetworkTest"

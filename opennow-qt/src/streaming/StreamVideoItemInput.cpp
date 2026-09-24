@@ -883,17 +883,13 @@ void StreamVideoItem::updateLocalCursor()
 }
 
 namespace {
-/// Whether a hidden system cursor must keep absolute input. Default on: the
-/// official client stayed absolute through the recorded Path of Exile 2 session
-/// (`Local cursor: 1 … shouldLock: 0` in geronimo.log.bak) and the OpenNOW-Mac
-/// reference keys input mode on the player's pointer lock, not on the seat's
-/// visibility. Switching to relative hides the host cursor, which is what stops
-/// the seat publishing a shape at all, leaving only the game-drawn cursor in the
-/// video. `OPENNOW_CURSOR_ABSOLUTE_HIDDEN=0` restores lock-on-hidden.
-bool cursorAbsoluteOnHidden()
+/// Optional dev override for the absolute-on-hidden cursor policy:
+/// `OPENNOW_CURSOR_ABSOLUTE_HIDDEN=0` forces the old lock-on-hidden behaviour
+/// regardless of the setting. Empty means "use the setting".
+std::optional<bool> cursorAbsoluteOnHiddenOverride()
 {
     const auto value = qEnvironmentVariable("OPENNOW_CURSOR_ABSOLUTE_HIDDEN");
-    if (value.isEmpty()) return true;
+    if (value.isEmpty()) return std::nullopt;
     return value != QStringLiteral("0")
         && value.compare(QStringLiteral("false"), Qt::CaseInsensitive) != 0;
 }
@@ -941,8 +937,17 @@ void StreamVideoItem::applyRemoteCursor(const QByteArray &bytes)
     const auto metadata = remoteCursorMetadata(bytes);
     m_remoteCursorKnown = true;
     m_remoteCursorVisible = !hidden;
+    // Settings-driven absolute-on-hidden policy (default on — the official
+    // client stayed absolute through the recorded Path of Exile 2 session,
+    // `Local cursor: 1 … shouldLock: 0` in geronimo.log.bak, and the
+    // OpenNOW-Mac reference keys input mode on the player's pointer lock,
+    // not on the seat's visibility). Switching to relative hides the host
+    // cursor, which is what stops the seat publishing a shape at all,
+    // leaving only the game-drawn cursor in the video. The env variable
+    // remains a dev override.
     setRelativeMouse(relativeInputForRemoteCursor(
-        hidden, m_relativeMouse, m_manualRelativeMouse, cursorAbsoluteOnHidden()));
+        hidden, m_relativeMouse, m_manualRelativeMouse,
+        cursorAbsoluteOnHiddenOverride().value_or(m_absoluteCursorOnHidden)));
     updateLocalCursor();
     if (hidden) return;
 
