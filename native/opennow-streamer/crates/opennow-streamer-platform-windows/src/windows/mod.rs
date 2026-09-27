@@ -8,6 +8,7 @@ macro_rules! video_log {
     }};
 }
 
+mod adapter_index;
 mod audio;
 mod color;
 #[cfg(feature = "nvdec-experiment")]
@@ -20,6 +21,8 @@ mod nvdec;
 mod render_timing;
 mod stage_timing;
 mod y410;
+
+pub(crate) use adapter_index::probe_adapter_decode;
 
 pub(crate) unsafe fn d3d11_adapter_luid(
     device: *mut std::ffi::c_void,
